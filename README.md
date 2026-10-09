@@ -27,3 +27,14 @@ and import it from your application entrypoint:
 from agent.agent import agent
 result = agent("Hello")
 ```
+
+Steps to use strands decider
+
+Install
+```bash
+uv add strands-decider
+```
+
+```bash
+uv run strands-decider serve StrandsAgents/strands-decider-2B-hobson-v21 --port 8099
+```
