@@ -1,0 +1,5 @@
+[project]
+name = "amazingplayer"
+version = "0.1.0"
+description = "A Capture the Flag game agent that plays as a member of a 3-player team, connecting via custom MCP server. Direct and tactical decision-making for fast-paced gameplay."
+requires-python = ">=3.10"
