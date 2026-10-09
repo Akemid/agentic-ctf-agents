@@ -8,7 +8,7 @@ from strands_harness import create_harness
 MODELS = {
     "haiku": "bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0",
     "opus": "bedrock/global.anthropic.claude-opus-4-6-v1",
-    "nova-lite": "bedrock/us.amazon.nova-lite-v1:0",
+    "nova-lite": "bedrock/global.amazon.nova-2-lite-v1:0",
 }
 
 
