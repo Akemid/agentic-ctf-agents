@@ -371,5 +371,172 @@ def make_deadlock_turn(me=(7, 7), enemy=(8, 6), target=(13, 7), events=None, tic
     }
 
 
+# ---------------------------------------------------------------------------
+# Plan memory (informational only: the model still decides every tick)
+# ---------------------------------------------------------------------------
+
+
+def tool_use_message(name, tool_input):
+    return {"role": "assistant", "content": [{"toolUse": {"toolUseId": "u", "name": name, "input": tool_input}}]}
+
+
+class TestUpdatePlan(unittest.TestCase):
+    def test_empty_plan_starts_fresh(self):
+        plan = loop.update_plan(loop.Plan(), "enemy_flag_direct", "enemy_flag", "move down", 5)
+        self.assertEqual(plan, loop.Plan("enemy_flag_direct", "enemy_flag", 5, "move down"))
+
+    def test_same_goal_keeps_since_tick_and_records_new_route_id(self):
+        plan = loop.Plan("enemy_flag_direct", "enemy_flag", 5, "move down")
+        plan = loop.update_plan(plan, "enemy_flag_detour", "enemy_flag", "move right", 8)
+        self.assertEqual(plan, loop.Plan("enemy_flag_detour", "enemy_flag", 5, "move right"))
+
+    def test_goal_change_resets_since_tick(self):
+        plan = loop.Plan("enemy_flag_direct", "enemy_flag", 5, "move down")
+        plan = loop.update_plan(plan, "tag:blue-1", "tag", "move up", 9)
+        self.assertEqual(plan, loop.Plan("tag:blue-1", "tag", 9, "move up"))
+
+    def test_wait_records_last_action_and_keeps_plan(self):
+        plan = loop.Plan("enemy_flag_direct", "enemy_flag", 5, "move down")
+        plan = loop.update_plan(plan, None, None, "wait", 6)
+        self.assertEqual(plan, loop.Plan("enemy_flag_direct", "enemy_flag", 5, "wait"))
+
+    def test_grab_flag_clears_plan(self):
+        plan = loop.Plan("enemy_flag_direct", "enemy_flag", 5, "move down")
+        plan = loop.update_plan(plan, None, None, "grab_flag", 6)
+        self.assertEqual(plan, loop.Plan(None, None, None, "grab_flag"))
+
+    def test_does_not_mutate_input(self):
+        plan = loop.Plan("a", "g", 1, "move up")
+        loop.update_plan(plan, "b", "h", "move down", 2)
+        self.assertEqual(plan, loop.Plan("a", "g", 1, "move up"))
+
+
+PLAN = loop.Plan("enemy_flag_direct", "enemy_flag", 5, "move down")
+
+
+class TestRenderStatePlan(unittest.TestCase):
+    def test_no_plan_output_unchanged(self):
+        turn = make_route_turn()
+        self.assertEqual(loop.render_state(turn, None), loop.render_state(turn))
+        self.assertNotIn("current plan", loop.render_state(turn))
+        self.assertNotIn("current plan", loop.render_state(turn, loop.Plan()))
+
+    def test_plan_line_when_route_still_offered(self):
+        text = loop.render_state(make_route_turn(tick=8), PLAN)
+        self.assertIn(
+            "current plan: enemy_flag_direct (goal enemy_flag) since tick 5, 3 ticks; last action: move down", text)
+        self.assertNotIn("no longer offered", text)
+
+    def test_plan_line_when_route_not_offered(self):
+        text = loop.render_state(make_route_turn(routes=[DETOUR], tick=8), PLAN)
+        self.assertIn(
+            "current plan: enemy_flag_direct (goal enemy_flag) since tick 5 \u2014 that route is no longer offered", text)
+
+    def test_plan_wording_is_neutral(self):
+        text = loop.render_state(make_route_turn(tick=8), PLAN).lower()
+        for word in ("recommend", "should"):
+            self.assertNotIn(word, text)
+
+
+class TestBuildOptionsPlan(unittest.TestCase):
+    def test_no_plan_unchanged(self):
+        turn = make_route_turn()
+        self.assertEqual(loop.build_options(turn, None), loop.build_options(turn))
+
+    def test_matching_route_annotated_as_continuing(self):
+        opts = loop.build_options(make_route_turn(tick=8), PLAN)
+        self.assertTrue(opts["enemy_flag_direct"].endswith(" | continues your current plan (3 ticks)"))
+
+    def test_same_goal_other_route_annotated(self):
+        opts = loop.build_options(make_route_turn(tick=8), PLAN)
+        self.assertTrue(opts["enemy_flag_detour"].endswith(" | same goal as your current plan, different route"))
+
+    def test_other_goals_and_wait_unchanged(self):
+        turn = make_route_turn(routes=[DETOUR, DIRECT, TAG_FAR], tick=8)
+        base, opts = loop.build_options(turn), loop.build_options(turn, PLAN)
+        self.assertEqual(opts["tag:blue-1"], base["tag:blue-1"])
+        self.assertEqual(opts["wait"], base["wait"])
+
+    def test_labels_and_order_unchanged(self):
+        turn = make_route_turn(tick=8)
+        self.assertEqual(list(loop.build_options(turn, PLAN)), list(loop.build_options(turn)))
+
+
+class TestExecutedRouteInference(unittest.TestCase):
+    def setUp(self):
+        self.turn = make_route_turn(routes=[DETOUR, DIRECT, TAG_FAR], tick=8)
+
+    def test_extract_action_call(self):
+        msgs = [{"role": "user", "content": [{"text": "hi"}]},
+                tool_use_message("move", {"direction": "up", "tick": 8})]
+        self.assertEqual(loop.extract_action_call(msgs), ("move", {"direction": "up", "tick": 8}))
+
+    def test_extract_action_call_none_when_no_tool_use(self):
+        self.assertIsNone(loop.extract_action_call([{"role": "assistant", "content": [{"text": "ok"}]}]))
+        self.assertIsNone(loop.extract_action_call([]))
+        self.assertIsNone(loop.extract_action_call(None))
+
+    def test_rationale_route_is_parsed(self):
+        call = ("move", {"direction": "down", "rationale": "route enemy_flag_direct"})
+        self.assertEqual(loop.infer_executed_route(call, self.turn, loop.Plan()), "enemy_flag_direct")
+
+    def test_rationale_with_tag_route_id(self):
+        call = ("move", {"direction": "up", "rationale": "route tag:blue-1."})
+        self.assertEqual(loop.infer_executed_route(call, self.turn, loop.Plan()), "tag:blue-1")
+
+    def test_rationale_with_unoffered_route_falls_back_to_direction(self):
+        call = ("move", {"direction": "right", "rationale": "route nonexistent"})
+        self.assertEqual(loop.infer_executed_route(call, self.turn, loop.Plan()), "enemy_flag_direct")
+
+    def test_direction_match_when_no_rationale(self):
+        call = ("move", {"direction": "down"})
+        self.assertEqual(loop.infer_executed_route(call, self.turn, loop.Plan()), "enemy_flag_detour")
+
+    def test_ambiguous_direction_prefers_plan_goal(self):
+        other = dict(TAG_FAR, id="tag:blue-9", first_step="down")  # same first step as DETOUR, other goal
+        turn = make_route_turn(routes=[other, DETOUR], tick=8)
+        plan = loop.Plan("enemy_flag_direct", "enemy_flag", 5, "move down")
+        self.assertEqual(loop.infer_executed_route(("move", {"direction": "down"}, ), turn, plan), "enemy_flag_detour")
+        tag_plan = loop.Plan("tag:blue-1", "tag", 5, "move up")
+        self.assertEqual(loop.infer_executed_route(("move", {"direction": "down"}), turn, tag_plan), "tag:blue-9")
+
+    def test_ambiguous_direction_without_plan_takes_first_by_id(self):
+        a = dict(DETOUR, id="b_route", first_step="left")
+        b = dict(DETOUR, id="a_route", first_step="left")
+        turn = make_route_turn(routes=[a, b], tick=8)
+        self.assertEqual(loop.infer_executed_route(("move", {"direction": "left"}), turn, loop.Plan()), "a_route")
+
+    def test_tag_maps_to_tag_route(self):
+        turn = make_route_turn(routes=[TAG_ADJACENT], tick=8)
+        self.assertEqual(loop.infer_executed_route(("tag", {"enemy_id": "blue-2"}), turn, loop.Plan()), "tag:blue-2")
+
+    def test_tag_without_offered_route_is_none(self):
+        self.assertIsNone(loop.infer_executed_route(("tag", {"enemy_id": "zzz"}), self.turn, loop.Plan()))
+
+    def test_non_route_tools_and_missing_call_are_none(self):
+        for call in (("wait", {"tick": 8}), ("grab_flag", {"tick": 8}), None):
+            self.assertIsNone(loop.infer_executed_route(call, self.turn, loop.Plan()))
+
+    def test_unmatched_direction_is_none(self):
+        self.assertIsNone(loop.infer_executed_route(("move", {"direction": "left"}), self.turn, loop.Plan()))
+
+
+class TestActionText(unittest.TestCase):
+    def test_describe_action(self):
+        self.assertEqual(loop.describe_action("move", {"direction": "down", "tick": 1}), "move down")
+        self.assertEqual(loop.describe_action("tag", {"enemy_id": "blue-2"}), "tag blue-2")
+        self.assertEqual(loop.describe_action("wait", {"tick": 1}), "wait")
+        self.assertEqual(loop.describe_action("grab_flag", {"tick": 1}), "grab_flag")
+
+    def test_plan_suffix(self):
+        self.assertEqual(loop.plan_suffix(PLAN), " [plan enemy_flag_direct since 5]")
+        self.assertEqual(loop.plan_suffix(loop.Plan()), "")
+
+    def test_instructions_mention_plan(self):
+        self.assertIn("current plan", loop.DECIDER_INSTRUCTIONS)
+        self.assertIn("current plan", loop.LLM_PLAN_NOTE)
+        self.assertNotIn("should", loop.DECIDER_INSTRUCTIONS.split("Your current plan")[1])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -44,6 +44,7 @@ import re
 import sys
 import tempfile
 import uuid
+from dataclasses import dataclass, replace
 from typing import Any
 
 from _client import Decider, ServerUnavailable
@@ -92,7 +93,15 @@ DECIDER_INSTRUCTIONS = (
     "tick. Reach the enemy flag, grab it, and carry it back to your own base. The options "
     "are routes offered by the server: choose between them by weighing length, whether "
     "they are blocked right now, and the risk of being tagged along the way. Tag enemies "
-    "inside your own field when it helps, and defend your flag when it is threatened."
+    "inside your own field when it helps, and defend your flag when it is threatened. "
+    "Your current plan, if any, is shown; switching routes every tick can undo your own "
+    "progress. Keep or change it based on the current situation."
+)
+
+LLM_PLAN_NOTE = (
+    "Your current plan, if any, is shown; switching routes every tick can undo your own "
+    "progress. Keep or change it based on the current situation. When you call move or tag "
+    "for a route, set `rationale` to `route <route_id>` (e.g. `route enemy_flag_direct`)."
 )
 
 # ---------------------------------------------------------------------------
@@ -192,6 +201,95 @@ def _routes(state: dict[str, Any]) -> list[dict[str, Any]]:
     return [r for r in routes if isinstance(r, dict) and isinstance(r.get("id"), str)] if isinstance(routes, list) else []
 
 
+@dataclass
+class Plan:
+    """Loop-owned memory of the route the agent last acted on. Informational only: the
+    model still decides every tick and may keep or change it."""
+
+    route_id: str | None = None
+    goal: str | None = None
+    since_tick: int | None = None
+    last_action: str | None = None
+
+
+def update_plan(plan: Plan, executed_route_id: str | None, executed_goal: str | None,
+                action_text: str, tick: int) -> Plan:
+    """New plan after an executed action (pure).
+
+    A route action keeps `since_tick` while the goal is unchanged (the route id may change
+    within a goal) and restarts it on a new goal. `grab_flag` clears the plan; any other
+    non-route action (e.g. `wait`) only records `last_action`.
+    """
+    if executed_route_id is None:
+        if action_text.split(" ", 1)[0] == "grab_flag":
+            return Plan(last_action=action_text)
+        return replace(plan, last_action=action_text)
+    same_goal = plan.route_id is not None and plan.goal == executed_goal and plan.since_tick is not None
+    since = plan.since_tick if same_goal else tick
+    return Plan(executed_route_id, executed_goal, since, action_text)
+
+
+def plan_suffix(plan: Plan) -> str:
+    """Short per-tick log suffix, empty when there is no plan."""
+    return f" [plan {plan.route_id} since {plan.since_tick}]" if plan.route_id else ""
+
+
+def describe_action(tool: str, arguments: dict[str, Any]) -> str:
+    """Short text for an executed action, e.g. `move down` or `tag blue-2`."""
+    if tool == "move" and arguments.get("direction"):
+        return f"move {arguments['direction']}"
+    if tool == "tag" and arguments.get("enemy_id"):
+        return f"tag {arguments['enemy_id']}"
+    return tool
+
+
+def route_goal(turn: dict[str, Any], route_id: str | None) -> str | None:
+    """Goal of the offered route with this id, if any."""
+    route = next((r for r in _routes(_state(turn)) if r["id"] == route_id), None)
+    return route.get("goal") if route else None
+
+
+def extract_action_call(messages: Any) -> tuple[str, dict[str, Any]] | None:
+    """First (tool name, input) action toolUse block in an agent's messages, if any."""
+    for message in messages or []:
+        content = message.get("content") if isinstance(message, dict) else None
+        for block in content if isinstance(content, list) else []:
+            use = block.get("toolUse") if isinstance(block, dict) else None
+            if isinstance(use, dict) and use.get("name") in ACTION_TOOLS:
+                tool_input = use.get("input")
+                return use["name"], tool_input if isinstance(tool_input, dict) else {}
+    return None
+
+
+def infer_executed_route(call: tuple[str, dict[str, Any]] | None, turn: dict[str, Any],
+                         plan: Plan) -> str | None:
+    """Which offered route an LLM action call corresponds to, or None for non-route actions.
+
+    Order: `rationale` of the form `route <id>` naming an offered route; `tag` -> `tag:<id>`;
+    `move` -> route whose first step matches (current plan's goal preferred, then lowest id).
+    """
+    if call is None:
+        return None
+    tool, arguments = call
+    routes = _routes(_state(turn))
+    offered = {r["id"]: r for r in routes}
+
+    match = re.search(r"route\s+(\S+)", str(arguments.get("rationale") or ""))
+    if match:
+        candidate = match.group(1).rstrip(".,;:!)\"'`")
+        if candidate in offered:
+            return candidate
+
+    if tool == "tag":
+        candidate = f"tag:{arguments.get('enemy_id')}"
+        return candidate if candidate in offered else None
+    if tool == "move":
+        matches = sorted((r for r in routes if r.get("first_step") == arguments.get("direction")),
+                         key=lambda r: (r.get("goal") != plan.goal, r["id"]))
+        return matches[0]["id"] if matches else None
+    return None
+
+
 def _plural(count: int, noun: str) -> str:
     return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
 
@@ -228,11 +326,12 @@ def describe_route(route: dict[str, Any]) -> str:
     return ", ".join(parts)
 
 
-def build_options(turn: dict[str, Any]) -> dict[str, str]:
+def build_options(turn: dict[str, Any], plan: Plan | None = None) -> dict[str, str]:
     """Options for the decider `choice` question, built from the state. Always includes `wait`.
 
     One option per server route (label = route id). Without routes, falls back to one
     `move_<dir>` option per open direction (and adjacent tags). No option is ever recommended.
+    With a `plan`, the matching route and other routes with the same goal get a neutral note.
     """
     state = _state(turn)
     me, team = _my_position(state), _my_team(state)
@@ -240,7 +339,13 @@ def build_options(turn: dict[str, Any]) -> dict[str, str]:
     options: dict[str, str] = {}
     routes = _routes(state)
     for route in routes:
-        options[route["id"]] = describe_route(route)
+        text = describe_route(route)
+        if plan is not None and plan.route_id:
+            if route["id"] == plan.route_id:
+                text += f" | continues your current plan ({_plural(_plan_age(turn, plan), 'tick')})"
+            elif plan.goal is not None and route.get("goal") == plan.goal:
+                text += " | same goal as your current plan, different route"
+        options[route["id"]] = text
     if not routes:
         for direction in _open_directions(state):
             options[f"move_{direction}"] = f"move one cell {direction}"
@@ -336,7 +441,22 @@ def _describe_event(event: Any) -> str:
             parts.append(f"{key}={value}")
     return " ".join(parts)
 
-def render_state(turn: dict[str, Any]) -> str:
+def _plan_age(turn: dict[str, Any], plan: Plan) -> int:
+    """Ticks elapsed since the plan started (0 when unknown)."""
+    if plan.since_tick is None:
+        return 0
+    return max(0, extract_tick(turn) - plan.since_tick)
+
+
+def _plan_line(turn: dict[str, Any], plan: Plan) -> str:
+    head = f"current plan: {plan.route_id} (goal {plan.goal}) since tick {plan.since_tick}"
+    if plan.route_id not in {r["id"] for r in _routes(_state(turn))}:
+        return f"{head} \u2014 that route is no longer offered"
+    line = f"{head}, {_plural(_plan_age(turn, plan), 'tick')}"
+    return f"{line}; last action: {plan.last_action}" if plan.last_action else line
+
+
+def render_state(turn: dict[str, Any], plan: Plan | None = None) -> str:
     """Short, human-readable summary of a wait_for_turn result for the decider and the LLM fallback."""
     state = _state(turn)
     me = _my_position(state)
@@ -351,6 +471,8 @@ def render_state(turn: dict[str, Any]) -> str:
             where = "in the enemy field"
         lines.append(f"you: {state.get('self')} ({_my_team(state)}) at {me}, {where}")
     lines.append(f"carrying the flag: {'yes' if _carrying(state) else 'no'}")
+    if plan is not None and plan.route_id:
+        lines.append(_plan_line(turn, plan))
 
     score = state.get("score")
     if isinstance(score, dict):
@@ -424,22 +546,28 @@ def join(client: MCPClient, match: str, name: str) -> str:
     raise RuntimeError(f"could not join match {match} on either team")
 
 
-def run_llm_tick(agent_factory, state: str, tick: int) -> int:
-    """Run the fallback Agent for one tick. Returns how many action tools it called."""
+def run_llm_tick(agent_factory, state: str, tick: int) -> tuple[int, tuple[str, dict[str, Any]] | None]:
+    """Run the fallback Agent for one tick (a fresh agent each time).
+
+    Returns (how many action tools it called, the (tool name, input) it executed or None).
+    """
     prompt = (
         f"{state}\n\nThis is tick {tick}. Pick ONE of the listed routes or actions and call "
         f"exactly one action tool ({', '.join(ACTION_TOOLS)}) with tick={tick}: move with the "
-        "route's first step, tag with the enemy id, grab_flag, or wait."
+        "route's first step, tag with the enemy id, grab_flag, or wait.\n" + LLM_PLAN_NOTE
     )
-    result = agent_factory()(prompt)
+    agent = agent_factory()
+    result = agent(prompt)
     tool_metrics = getattr(getattr(result, "metrics", None), "tool_metrics", {}) or {}
-    return sum(getattr(m, "call_count", 0) for m in tool_metrics.values())
+    calls = sum(getattr(m, "call_count", 0) for m in tool_metrics.values())
+    return calls, extract_action_call(getattr(agent, "messages", None))
 
 
 def play(client: MCPClient, decider: Decider, args: argparse.Namespace) -> Stats:
     stats = Stats()
     decider_down = False
     errors = 0
+    plan = Plan()
 
     action_tools = [t for t in client.list_tools_sync() if t.tool_name in ACTION_TOOLS]
     agent_factory = lambda: Agent(  # noqa: E731
@@ -466,8 +594,8 @@ def play(client: MCPClient, decider: Decider, args: argparse.Namespace) -> Stats
         errors = 0
 
         tick = extract_tick(turn)
-        state = render_state(turn)
-        options = build_options(turn)
+        state = render_state(turn, plan)
+        options = build_options(turn, plan)
         if args.raw_turns:
             print(f"[tick {tick}] raw turn:\n{json.dumps(turn, indent=2, ensure_ascii=False)}")
             print(f"[tick {tick}] state sent to decider:\n{state}")
@@ -491,7 +619,9 @@ def play(client: MCPClient, decider: Decider, args: argparse.Namespace) -> Stats
             tool, arguments = label_to_call(chosen, tick, turn)
             outcome = call_tool(client, tool, arguments)
             stats.decider_ticks += 1
-            print(f"[tick {tick}] decider -> {chosen} (confidence {confidence:.2f})")
+            route_id = chosen if route_goal(turn, chosen) is not None else None
+            plan = update_plan(plan, route_id, route_goal(turn, route_id), describe_action(tool, arguments), tick)
+            print(f"[tick {tick}] decider -> {chosen} (confidence {confidence:.2f}){plan_suffix(plan)}")
             if outcome["_is_error"]:
                 print(f"    action error: {outcome}")
             continue
@@ -499,8 +629,13 @@ def play(client: MCPClient, decider: Decider, args: argparse.Namespace) -> Stats
         reason = "decider unavailable" if decider_down else f"low confidence ({chosen}, {confidence:.2f})"
         print(f"[tick {tick}] LLM fallback: {reason}")
         stats.llm_ticks += 1
-        if run_llm_tick(agent_factory, state, tick) == 0:
+        calls, call = run_llm_tick(agent_factory, state, tick)
+        if calls == 0:
             print("    warning: the LLM made no action call; the server will count this tick as wait")
+        if call is not None:
+            route_id = infer_executed_route(call, turn, plan)
+            plan = update_plan(plan, route_id, route_goal(turn, route_id), describe_action(*call), tick)
+            print(f"    LLM executed {describe_action(*call)}{plan_suffix(plan)}")
 
 
 # ---------------------------------------------------------------------------
