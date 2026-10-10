@@ -5,3 +5,5 @@ __pycache__/
 .env.local
 .agent/memory/
 .agent/sessions/
+.atl/*
+logs/*

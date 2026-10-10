@@ -43,9 +43,10 @@ import os
 import re
 import sys
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Literal
 
 from _client import Decider, ServerUnavailable
 from strands import Agent
@@ -85,6 +86,9 @@ DIRECTIONS = ("up", "down", "left", "right")
 
 DEFAULT_THRESHOLD = 0.85
 MAX_CONSECUTIVE_TOOL_ERRORS = 5
+DEFAULT_DEADLINE_MS = 5000
+DEFAULT_LLM_BUDGET_MS = 4500
+DEFAULT_SAFETY_MARGIN_MS = 300
 
 DECIDER_LOCK_FILE = os.path.join(tempfile.gettempdir(), "strands-decider.lock")
 
@@ -407,6 +411,76 @@ def parse_choice(answer: dict[str, Any]) -> tuple[str | None, float]:
     return label, float(confidence) if isinstance(confidence, (int, float)) else 0.0
 
 
+def remaining_ms(deadline_remaining_ms: float | None, elapsed_ms: float) -> float:
+    """Time left in the tick: the deadline remaining at receipt minus time elapsed since."""
+    base = DEFAULT_DEADLINE_MS if deadline_remaining_ms is None else deadline_remaining_ms
+    return base - elapsed_ms
+
+
+def _number(value: Any) -> float | None:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def turn_remaining_ms(turn: dict[str, Any], elapsed_ms: float) -> float:
+    """`remaining_ms` for a turn: `deadline_remaining_ms`, else `deadline_ms`, else 5000."""
+    base = _number(turn.get("deadline_remaining_ms"))
+    if base is None:
+        base = _number(turn.get("deadline_ms"))
+    return remaining_ms(base, elapsed_ms)
+
+
+def choose_path(chosen: str | None, confidence: float, threshold: float, options: dict[str, str],
+                remaining: float, llm_budget_ms: float, margin_ms: float,
+                decider_down: bool) -> Literal["decider", "budget", "llm", "wait"]:
+    """How to act this tick (pure).
+
+    decider: confident, offered choice. llm: not confident but there is time for the LLM.
+    budget: no time for the LLM and the decider's choice is a valid option, so run it.
+    wait: no time for the LLM and nothing valid to run.
+    """
+    valid = chosen is not None and chosen in options
+    if not decider_down and valid and accept_choice(chosen, confidence, threshold):
+        return "decider"
+    if remaining >= llm_budget_ms + margin_ms:
+        return "llm"
+    if not decider_down and valid:
+        return "budget"
+    return "wait"
+
+
+def warmup_question() -> tuple[str, dict[str, dict[str, Any]]]:
+    """A representative (state, questions) pair for the decider warm-up (pure, no server)."""
+    def route(rid, goal, step, length, risks=(), blocked=False, dist=3):
+        return {"id": rid, "goal": goal, "first_step": step, "length": length, "path": [],
+                "blocked_now": blocked, "blocked_reason": "contention" if blocked else None,
+                "risks": [{"step": st, "enemy_id": en} for st, en in risks], "min_enemy_distance": dist}
+
+    def agent(aid, team, x, y):
+        return {"id": aid, "team": team, "position": {"x": x, "y": y}, "carrying": None, "disconnected": False}
+
+    turn = {
+        "status": "turn", "tick": 12,
+        "state": {
+            "tick": 12,
+            "agents": [agent("blue-1", "blue", 9, 7), agent("blue-2", "blue", 11, 4),
+                       agent("red-1", "red", 5, 6), agent("red-2", "red", 4, 9), agent("red-3", "red", 2, 7)],
+            "flags": [{"team": "red", "base": {"x": 1, "y": 7}, "position": {"x": 1, "y": 7}, "carried_by": None},
+                      {"team": "blue", "base": {"x": 13, "y": 7}, "position": {"x": 13, "y": 7}, "carried_by": None}],
+            "score": {"red": 1, "blue": 0},
+            "fields": {"red": {"min_x": 0, "max_x": 6}, "blue": {"min_x": 8, "max_x": 14}, "neutral_x": 7},
+            "self": "blue-1", "self_position": {"x": 9, "y": 7},
+            "teammates": [{"id": "blue-2", "position": {"x": 11, "y": 4}}],
+            "routes": [route("enemy_flag_direct", "enemy_flag", "left", 8, [(3, "red-1")], dist=2),
+                       route("enemy_flag_detour", "enemy_flag", "up", 11, dist=4),
+                       route("tag:red-1", "tag", "left", 4, dist=4),
+                       route("home_base", "own_base", "right", 4, blocked=True)],
+        },
+        "events": [{"type": "moved", "agent_id": "red-1", "from": {"x": 6, "y": 6}, "to": {"x": 5, "y": 6}}],
+    }
+    plan = Plan("enemy_flag_direct", "enemy_flag", 9, "move left")
+    return render_state(turn, plan), {"action": Decider.choice(DECIDER_INSTRUCTIONS, build_options(turn, plan))}
+
+
 def accept_choice(label: str | None, confidence: float, threshold: float) -> bool:
     return label is not None and confidence >= threshold
 
@@ -518,12 +592,14 @@ class Stats:
     def __init__(self) -> None:
         self.decider_ticks = 0
         self.llm_ticks = 0
+        self.budget_ticks = 0
         self.latencies_ms: list[float] = []
 
     def summary(self) -> str:
         avg = f"{sum(self.latencies_ms) / len(self.latencies_ms):.0f} ms" if self.latencies_ms else "n/a"
         return (
             f"ticks decided by decider: {self.decider_ticks}, by LLM fallback: {self.llm_ticks}, "
+            f"by budget: {self.budget_ticks}, "
             f"decider avg latency: {avg}"
         )
 
@@ -531,7 +607,8 @@ class Stats:
 def call_tool(client: MCPClient, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     result = client.call_tool_sync(f"{name}-{uuid.uuid4().hex[:8]}", name, arguments)
     parsed = parse_tool_result(result)
-    parsed["_is_error"] = bool(result.get("isError"))
+    # Tool errors set isError; transport errors (e.g. "session not found") only set status="error".
+    parsed["_is_error"] = result.get("status") == "error" or bool(result.get("isError"))
     return parsed
 
 
@@ -563,6 +640,19 @@ def run_llm_tick(agent_factory, state: str, tick: int) -> tuple[int, tuple[str, 
     return calls, extract_action_call(getattr(agent, "messages", None))
 
 
+def warm_up(decider: Decider) -> bool:
+    """Send one throwaway question through the shared lock. False if the decider is unreachable."""
+    state, questions = warmup_question()
+    started = time.monotonic()
+    try:
+        ask_serialized(decider, state, questions)
+    except (ServerUnavailable, OSError, http.client.HTTPException) as exc:
+        print(f"[decider] warm-up failed: {exc}\n    -> LLM fallback for the rest of the match")
+        return False
+    print(f"decider warm-up: {(time.monotonic() - started) * 1000:.0f} ms (server {decider.last_latency_ms} ms)")
+    return True
+
+
 def play(client: MCPClient, decider: Decider, args: argparse.Namespace) -> Stats:
     stats = Stats()
     decider_down = False
@@ -576,6 +666,9 @@ def play(client: MCPClient, decider: Decider, args: argparse.Namespace) -> Stats
         system_prompt=SYSTEM_PROMPT,
         callback_handler=None,
     )
+
+    if not args.no_warmup and not warm_up(decider):
+        decider_down = True
 
     join(client, args.match, sanitize_name(args.name))
 
@@ -594,6 +687,7 @@ def play(client: MCPClient, decider: Decider, args: argparse.Namespace) -> Stats
         errors = 0
 
         tick = extract_tick(turn)
+        turn_received = time.monotonic()
         state = render_state(turn, plan)
         options = build_options(turn, plan)
         if args.raw_turns:
@@ -605,6 +699,7 @@ def play(client: MCPClient, decider: Decider, args: argparse.Namespace) -> Stats
         confidence = 0.0
         if not decider_down:
             question = {"action": Decider.choice(DECIDER_INSTRUCTIONS, options)}
+            started = time.monotonic()
             try:
                 answers = ask_serialized(decider, state, question)
             except (ServerUnavailable, OSError, http.client.HTTPException) as exc:
@@ -614,14 +709,38 @@ def play(client: MCPClient, decider: Decider, args: argparse.Namespace) -> Stats
                 chosen, confidence = parse_choice(answers["action"])
                 if decider.last_latency_ms is not None:
                     stats.latencies_ms.append(float(decider.last_latency_ms))
+                print(f"[tick {tick}] timing: decider wall {(time.monotonic() - started) * 1000:.0f} ms "
+                      f"(server {decider.last_latency_ms} ms), deadline_remaining at receipt "
+                      f"{turn.get('deadline_remaining_ms')} ms")
 
-        if chosen in options and accept_choice(chosen, confidence, args.threshold):
+        remaining = turn_remaining_ms(turn, (time.monotonic() - turn_received) * 1000)
+        path = choose_path(chosen, confidence, args.threshold, options, remaining,
+                           args.llm_budget_ms, args.safety_margin_ms, decider_down)
+
+        if path in ("decider", "budget"):
             tool, arguments = label_to_call(chosen, tick, turn)
             outcome = call_tool(client, tool, arguments)
-            stats.decider_ticks += 1
             route_id = chosen if route_goal(turn, chosen) is not None else None
             plan = update_plan(plan, route_id, route_goal(turn, route_id), describe_action(tool, arguments), tick)
-            print(f"[tick {tick}] decider -> {chosen} (confidence {confidence:.2f}){plan_suffix(plan)}")
+            if path == "decider":
+                stats.decider_ticks += 1
+                print(f"[tick {tick}] decider -> {chosen} (confidence {confidence:.2f}){plan_suffix(plan)}")
+            else:
+                stats.budget_ticks += 1
+                print(f"[tick {tick}] budget: {remaining:.0f} ms left < "
+                      f"{args.llm_budget_ms + args.safety_margin_ms:.0f} ms needed for LLM -> "
+                      f"executing decider choice {chosen} ({confidence:.2f}){plan_suffix(plan)}")
+            if outcome["_is_error"]:
+                print(f"    action error: {outcome}")
+            continue
+
+        if path == "wait":
+            outcome = call_tool(client, "wait", {"tick": tick})
+            stats.budget_ticks += 1
+            plan = update_plan(plan, None, None, "wait", tick)
+            why = "decider unavailable" if decider_down else f"no valid decider choice ({chosen}, {confidence:.2f})"
+            print(f"[tick {tick}] budget: {remaining:.0f} ms left < "
+                  f"{args.llm_budget_ms + args.safety_margin_ms:.0f} ms needed for LLM, {why} -> wait")
             if outcome["_is_error"]:
                 print(f"    action error: {outcome}")
             continue
@@ -629,7 +748,10 @@ def play(client: MCPClient, decider: Decider, args: argparse.Namespace) -> Stats
         reason = "decider unavailable" if decider_down else f"low confidence ({chosen}, {confidence:.2f})"
         print(f"[tick {tick}] LLM fallback: {reason}")
         stats.llm_ticks += 1
+        llm_started = time.monotonic()
         calls, call = run_llm_tick(agent_factory, state, tick)
+        print(f"[tick {tick}] timing: LLM wall {(time.monotonic() - llm_started) * 1000:.0f} ms, "
+              f"total since turn {(time.monotonic() - turn_received) * 1000:.0f} ms")
         if calls == 0:
             print("    warning: the LLM made no action call; the server will count this tick as wait")
         if call is not None:
@@ -654,6 +776,11 @@ def parse_args() -> argparse.Namespace:
                         help=f"Minimum decider confidence to act without the LLM (default: {DEFAULT_THRESHOLD}).")
     parser.add_argument("--raw-turns", action="store_true",
                         help="Print each raw wait_for_turn payload, the state sent to the decider and its options.")
+    parser.add_argument("--llm-budget-ms", type=float, default=DEFAULT_LLM_BUDGET_MS,
+                        help=f"Expected LLM fallback time; skipped when less time is left (default: {DEFAULT_LLM_BUDGET_MS}).")
+    parser.add_argument("--safety-margin-ms", type=float, default=DEFAULT_SAFETY_MARGIN_MS,
+                        help=f"Extra margin added to the LLM budget (default: {DEFAULT_SAFETY_MARGIN_MS}).")
+    parser.add_argument("--no-warmup", action="store_true", help="Skip the decider warm-up before joining the match.")
     return parser.parse_args()
 
 

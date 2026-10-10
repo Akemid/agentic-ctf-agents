@@ -538,5 +538,124 @@ class TestActionText(unittest.TestCase):
         self.assertNotIn("should", loop.DECIDER_INSTRUCTIONS.split("Your current plan")[1])
 
 
+class TestRemainingMs(unittest.TestCase):
+    def test_subtracts_elapsed(self):
+        self.assertEqual(loop.remaining_ms(5000, 1200), 3800)
+
+    def test_can_go_negative(self):
+        self.assertEqual(loop.remaining_ms(1000, 1500), -500)
+
+    def test_none_falls_back_to_default(self):
+        self.assertEqual(loop.remaining_ms(None, 1000), loop.DEFAULT_DEADLINE_MS - 1000)
+
+    def test_turn_uses_remaining_then_deadline_then_default(self):
+        self.assertEqual(loop.turn_remaining_ms({"deadline_remaining_ms": 2646, "deadline_ms": 5000}, 600), 2046)
+        self.assertEqual(loop.turn_remaining_ms({"deadline_ms": 4000}, 500), 3500)
+        self.assertEqual(loop.turn_remaining_ms({}, 500), 4500)
+
+    def test_turn_ignores_non_numeric(self):
+        self.assertEqual(loop.turn_remaining_ms({"deadline_remaining_ms": "x", "deadline_ms": True}, 0), 5000)
+
+
+class TestChoosePath(unittest.TestCase):
+    OPTIONS = {"enemy_flag_direct": "d", "wait": "w"}
+
+    def path(self, chosen="enemy_flag_direct", confidence=0.9, remaining=3000.0, down=False, options=None):
+        return loop.choose_path(chosen, confidence, 0.85, self.OPTIONS if options is None else options,
+                                remaining, 4500, 300, down)
+
+    def test_above_threshold_is_decider_even_without_time(self):
+        self.assertEqual(self.path(remaining=10), "decider")
+
+    def test_low_confidence_enough_time_is_llm(self):
+        self.assertEqual(self.path(confidence=0.31, remaining=4801), "llm")
+
+    def test_low_confidence_no_time_valid_option_is_budget(self):
+        self.assertEqual(self.path(confidence=0.31, remaining=1234), "budget")
+
+    def test_exactly_needed_time_is_llm(self):
+        self.assertEqual(self.path(confidence=0.31, remaining=4800), "llm")
+
+    def test_invalid_choice_no_time_is_wait(self):
+        self.assertEqual(self.path(chosen="nope", confidence=0.31, remaining=1000), "wait")
+
+    def test_none_choice_no_time_is_wait(self):
+        self.assertEqual(self.path(chosen=None, confidence=0.0, remaining=1000), "wait")
+
+    def test_decider_down_no_time_is_wait(self):
+        self.assertEqual(self.path(chosen=None, confidence=0.0, remaining=1000, down=True), "wait")
+
+    def test_decider_down_with_time_is_llm(self):
+        self.assertEqual(self.path(chosen=None, confidence=0.0, remaining=9000, down=True), "llm")
+
+    def test_invalid_choice_with_time_is_llm(self):
+        self.assertEqual(self.path(chosen="nope", confidence=0.5, remaining=9000), "llm")
+
+
+class TestWarmup(unittest.TestCase):
+    def test_shape(self):
+        state, questions = loop.warmup_question()
+        self.assertIsInstance(state, str)
+        action = questions["action"]
+        self.assertEqual(action["type"], "choice")
+        self.assertGreaterEqual(len(action["criteria"]), 4)
+        self.assertIn("wait", action["criteria"])
+
+    def test_state_length_is_representative(self):
+        state, _ = loop.warmup_question()
+        self.assertGreaterEqual(len(state.splitlines()), 12)
+        self.assertGreater(len(state), 500)
+        self.assertLess(len(state), 1500)
+
+    def test_state_lists_three_or_four_routes(self):
+        state, questions = loop.warmup_question()
+        routes = [k for k in questions["action"]["criteria"] if k != "wait"]
+        self.assertTrue(all(f"  {r}:" in state for r in routes if r.startswith(("enemy", "tag:", "home"))))
+
+
+class TestStatsBudget(unittest.TestCase):
+    def test_summary_includes_budget_ticks(self):
+        stats = loop.Stats()
+        stats.budget_ticks = 3
+        self.assertIn("by budget: 3", stats.summary())
+
+
+class TestArgs(unittest.TestCase):
+    def test_new_flags_defaults(self):
+        old = sys.argv
+        sys.argv = ["x"]
+        try:
+            args = loop.parse_args()
+        finally:
+            sys.argv = old
+        self.assertEqual((args.llm_budget_ms, args.safety_margin_ms, args.no_warmup), (4500, 300, False))
+
+
+class FakeClient:
+    def __init__(self, result: dict) -> None:
+        self._result = result
+
+    def call_tool_sync(self, tool_use_id, name, arguments):
+        return self._result
+
+
+class CallToolErrorTests(unittest.TestCase):
+    def test_tool_error_flagged_by_is_error(self):
+        parsed = loop.call_tool(FakeClient(tool_result({"reason": "match_full"}, is_error=True)), "join_match", {})
+        self.assertTrue(parsed["_is_error"])
+
+    def test_transport_error_flagged_by_status_only(self):
+        # strands' _handle_tool_execution_error (e.g. "session not found") sets status="error"
+        # and no isError key.
+        result = {"status": "error", "toolUseId": "t",
+                  "content": [{"text": "Tool execution failed: session not found"}]}
+        parsed = loop.call_tool(FakeClient(result), "wait_for_turn", {})
+        self.assertTrue(parsed["_is_error"])
+
+    def test_success_not_flagged(self):
+        parsed = loop.call_tool(FakeClient(tool_result({"status": "turn", "tick": 1})), "wait_for_turn", {})
+        self.assertFalse(parsed["_is_error"])
+
+
 if __name__ == "__main__":
     unittest.main()
