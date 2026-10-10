@@ -41,6 +41,13 @@ SYSTEM_PROMPT = (
     "communicate team positions, coordinate flag captures, and respond to enemy movements "
     "with speed and precision. Analyze game state efficiently and prioritize actions that "
     "give your team the best advantage."
+    " Each wait_for_turn result includes state.routes: route options computed by the "
+    "server (ids like enemy_flag_direct, enemy_flag_safe, enemy_flag_detour, own_base_*, "
+    "tag:<enemy_id>, defend_flag). The server never recommends one; you choose. Weigh each "
+    "route's length, blocked_now/blocked_reason, risks (cells where you can be tagged) and "
+    "min_enemy_distance, then call move with that route's first_step. A tag route with "
+    "length 0 means the enemy is adjacent: call tag with that enemy_id. Call grab_flag when "
+    "standing on the enemy flag. Call exactly one action per tick, with the current tick."
 )
 
 MCP_SERVER_NAME = "ctf-game"
