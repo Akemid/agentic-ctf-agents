@@ -9,6 +9,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -238,6 +240,24 @@ class TestLabelToCall(unittest.TestCase):
         self.assertEqual((args["enemy_id"], args["tick"]), ("blue-2", 7))
         self.assertIn("tag:blue-2", args["rationale"])
 
+    def _arrived(self, route_id, goal):
+        # Real tick-16 shape: standing on the target, the server sends length 0 and first_step null.
+        return {"id": route_id, "goal": goal, "first_step": None, "length": 0, "path": [],
+                "blocked_now": False, "blocked_reason": None, "risks": [], "min_enemy_distance": 12}
+
+    def test_arrived_enemy_flag_route_maps_to_grab_flag(self):
+        turn = make_route_turn(routes=[self._arrived("enemy_flag_direct", "enemy_flag")], me=(13, 7))
+        tool, args = loop.label_to_call("enemy_flag_direct", 16, turn)
+        self.assertEqual(tool, "grab_flag")
+        self.assertEqual(args["tick"], 16)
+        self.assertIn("enemy_flag_direct", args["rationale"])
+
+    def test_arrived_own_base_and_defend_routes_map_to_wait(self):
+        for route_id, goal in (("own_base_direct", "own_base"), ("defend_flag", "defend_flag")):
+            turn = make_route_turn(routes=[self._arrived(route_id, goal)])
+            tool, args = loop.label_to_call(route_id, 4, turn)
+            self.assertEqual((tool, args["tick"]), ("wait", 4))
+
     def test_far_tag_route_maps_to_move(self):
         turn = make_route_turn(routes=[TAG_FAR])
         tool, args = loop.label_to_call("tag:blue-1", 7, turn)
@@ -380,35 +400,132 @@ def tool_use_message(name, tool_input):
     return {"role": "assistant", "content": [{"toolUse": {"toolUseId": "u", "name": name, "input": tool_input}}]}
 
 
+def cells(*xy):
+    return [{"x": x, "y": y} for x, y in xy]
+
+
+def path_route(route_id, goal, path, first_step="right"):
+    return {"id": route_id, "goal": goal, "first_step": first_step, "length": len(path), "path": cells(*path),
+            "blocked_now": False, "blocked_reason": None, "risks": [], "min_enemy_distance": 5}
+
+
+# Real regression: plan chosen at (2,7) heading right along y=7 (8 cells, current cell excluded).
+PREV_PATH = tuple((x, 7) for x in range(3, 11))
+
+
+def reg_plan(**overrides):
+    fields = dict(route_id="enemy_flag_direct", goal="enemy_flag", since_tick=5, last_action="move right",
+                  path=PREV_PATH, position=(2, 7))
+    fields.update(overrides)
+    return loop.Plan(**fields)
+
+
+def reg_turn(me=(3, 7), tick=6, routes=None):
+    """Next tick: I am at (3,7). The direct route keeps going right; the detour is recomputed backwards."""
+    direct = path_route("enemy_flag_direct", "enemy_flag", [(x, 7) for x in range(4, 12)])
+    detour = path_route("enemy_flag_detour", "enemy_flag",
+                        [(2, 7), (2, 6), (2, 5), (2, 4), (2, 3), (3, 3), (4, 3), (5, 3)], first_step="left")
+    return make_route_turn(routes=[direct, detour] if routes is None else routes, me=me, tick=tick)
+
+
+class TestContinuesPath(unittest.TestCase):
+    def test_moved_one_step_along_path_and_route_continues(self):
+        route = [(x, 7) for x in range(4, 12)]  # 8 cells; expected remainder has 7 -> compare 7
+        self.assertTrue(loop.continues_path(PREV_PATH, (2, 7), (3, 7), route))
+
+    def test_moved_along_path_but_route_goes_backwards(self):
+        route = [(2, 7), (2, 6), (2, 5)]
+        self.assertFalse(loop.continues_path(PREV_PATH, (2, 7), (3, 7), route))
+
+    def test_shorter_route_compares_overlapping_prefix(self):
+        self.assertTrue(loop.continues_path(PREV_PATH, (2, 7), (3, 7), [(4, 7), (5, 7)]))
+        self.assertFalse(loop.continues_path(PREV_PATH, (2, 7), (3, 7), [(4, 7), (4, 8)]))
+
+    def test_previous_path_of_length_one_and_now_on_its_end(self):
+        self.assertFalse(loop.continues_path(((3, 7),), (2, 7), (3, 7), [(4, 7), (5, 7)]))
+
+    def test_not_moved_route_starts_with_previous_path(self):
+        self.assertTrue(loop.continues_path(PREV_PATH, (2, 7), (2, 7), list(PREV_PATH)))
+        self.assertTrue(loop.continues_path(PREV_PATH, (2, 7), (2, 7), [(3, 7), (4, 7)]))
+
+    def test_not_moved_route_differs(self):
+        self.assertFalse(loop.continues_path(PREV_PATH, (2, 7), (2, 7), [(1, 7), (0, 7)]))
+
+    def test_respawned_or_moved_elsewhere(self):
+        self.assertFalse(loop.continues_path(PREV_PATH, (2, 7), (14, 7), list(PREV_PATH)))
+        self.assertFalse(loop.continues_path(PREV_PATH, (2, 7), (4, 7), [(5, 7), (6, 7)]))  # two steps
+
+    def test_malformed_or_empty_inputs(self):
+        self.assertFalse(loop.continues_path(None, (2, 7), (3, 7), [(4, 7)]))
+        self.assertFalse(loop.continues_path((), (2, 7), (2, 7), [(3, 7)]))
+        self.assertFalse(loop.continues_path(PREV_PATH, (2, 7), None, [(4, 7)]))
+        self.assertFalse(loop.continues_path(PREV_PATH, (2, 7), (3, 7), None))
+        self.assertFalse(loop.continues_path(PREV_PATH, (2, 7), (3, 7), []))
+        self.assertFalse(loop.continues_path(PREV_PATH, None, None, [(4, 7)]))
+
+
 class TestUpdatePlan(unittest.TestCase):
     def test_empty_plan_starts_fresh(self):
         plan = loop.update_plan(loop.Plan(), "enemy_flag_direct", "enemy_flag", "move down", 5)
         self.assertEqual(plan, loop.Plan("enemy_flag_direct", "enemy_flag", 5, "move down"))
 
-    def test_same_goal_keeps_since_tick_and_records_new_route_id(self):
-        plan = loop.Plan("enemy_flag_direct", "enemy_flag", 5, "move down")
-        plan = loop.update_plan(plan, "enemy_flag_detour", "enemy_flag", "move right", 8)
-        self.assertEqual(plan, loop.Plan("enemy_flag_detour", "enemy_flag", 5, "move right"))
+    def test_stores_path_and_position(self):
+        plan = loop.update_plan(loop.Plan(), "enemy_flag_direct", "enemy_flag", "move right", 5,
+                                [(3, 7), (4, 7)], (2, 7))
+        self.assertEqual(plan, loop.Plan("enemy_flag_direct", "enemy_flag", 5, "move right",
+                                         ((3, 7), (4, 7)), (2, 7)))
+
+    def test_same_goal_without_continuing_path_resets_since_tick(self):
+        plan = reg_plan()
+        plan = loop.update_plan(plan, "enemy_flag_detour", "enemy_flag", "move left", 6,
+                                [(2, 7), (2, 6)], (3, 7))
+        self.assertEqual(plan.since_tick, 6)
+        self.assertEqual((plan.route_id, plan.path, plan.position), ("enemy_flag_detour", ((2, 7), (2, 6)), (3, 7)))
+
+    def test_continuing_path_keeps_since_tick_even_if_route_id_changes(self):
+        plan = loop.update_plan(reg_plan(), "enemy_flag_detour", "enemy_flag", "move right", 6,
+                                [(x, 7) for x in range(4, 12)], (3, 7))
+        self.assertEqual(plan.since_tick, 5)
+        self.assertEqual(plan.route_id, "enemy_flag_detour")
+        self.assertEqual(plan.position, (3, 7))
+        self.assertEqual(plan.path[0], (4, 7))
+
+    def test_blocked_move_keeps_since_tick_when_path_still_continues(self):
+        plan = loop.update_plan(reg_plan(), "enemy_flag_direct", "enemy_flag", "move right", 6,
+                                list(PREV_PATH), (2, 7))
+        self.assertEqual(plan.since_tick, 5)
 
     def test_goal_change_resets_since_tick(self):
-        plan = loop.Plan("enemy_flag_direct", "enemy_flag", 5, "move down")
-        plan = loop.update_plan(plan, "tag:blue-1", "tag", "move up", 9)
-        self.assertEqual(plan, loop.Plan("tag:blue-1", "tag", 9, "move up"))
+        plan = loop.update_plan(reg_plan(), "tag:blue-1", "tag", "move right", 6,
+                                [(x, 7) for x in range(4, 12)], (3, 7))
+        self.assertEqual(plan.since_tick, 6)
+        self.assertEqual(plan.goal, "tag")
+
+    def test_respawn_resets_since_tick(self):
+        plan = loop.update_plan(reg_plan(), "enemy_flag_direct", "enemy_flag", "move left", 9,
+                                [(13, 7), (12, 7)], (14, 7))
+        self.assertEqual(plan.since_tick, 9)
 
     def test_wait_records_last_action_and_keeps_plan(self):
-        plan = loop.Plan("enemy_flag_direct", "enemy_flag", 5, "move down")
-        plan = loop.update_plan(plan, None, None, "wait", 6)
-        self.assertEqual(plan, loop.Plan("enemy_flag_direct", "enemy_flag", 5, "wait"))
+        plan = loop.update_plan(reg_plan(), None, None, "wait", 6)
+        self.assertEqual(plan, reg_plan(last_action="wait"))
 
     def test_grab_flag_clears_plan(self):
-        plan = loop.Plan("enemy_flag_direct", "enemy_flag", 5, "move down")
-        plan = loop.update_plan(plan, None, None, "grab_flag", 6)
+        plan = loop.update_plan(reg_plan(), None, None, "grab_flag", 6)
         self.assertEqual(plan, loop.Plan(None, None, None, "grab_flag"))
+        self.assertIsNone(plan.path)
+        self.assertIsNone(plan.position)
 
     def test_does_not_mutate_input(self):
         plan = loop.Plan("a", "g", 1, "move up")
-        loop.update_plan(plan, "b", "h", "move down", 2)
+        loop.update_plan(plan, "b", "h", "move down", 2, [(1, 1)], (0, 1))
         self.assertEqual(plan, loop.Plan("a", "g", 1, "move up"))
+
+    def test_route_path_helper_reads_offered_route(self):
+        turn = reg_turn()
+        self.assertEqual(loop.route_path(turn, "enemy_flag_detour")[:2], ((2, 7), (2, 6)))
+        self.assertIsNone(loop.route_path(turn, "nope"))
+        self.assertIsNone(loop.route_path(turn, None))
 
 
 PLAN = loop.Plan("enemy_flag_direct", "enemy_flag", 5, "move down")
@@ -421,19 +538,27 @@ class TestRenderStatePlan(unittest.TestCase):
         self.assertNotIn("current plan", loop.render_state(turn))
         self.assertNotIn("current plan", loop.render_state(turn, loop.Plan()))
 
-    def test_plan_line_when_route_still_offered(self):
-        text = loop.render_state(make_route_turn(tick=8), PLAN)
+    def test_plan_line_when_a_route_continues_the_path(self):
+        text = loop.render_state(reg_turn(), reg_plan())
         self.assertIn(
-            "current plan: enemy_flag_direct (goal enemy_flag) since tick 5, 3 ticks; last action: move down", text)
+            "current plan: goal enemy_flag, heading to (10, 7) since tick 5, 1 tick; last action: move right", text)
+        self.assertNotIn("no offered route", text)
+
+    def test_plan_line_when_no_route_continues_the_path(self):
+        detour_only = [reg_turn()["state"]["routes"][1]]
+        text = loop.render_state(reg_turn(routes=detour_only), reg_plan())
+        self.assertIn(
+            "current plan: goal enemy_flag, heading to (10, 7) since tick 5 \u2014 no offered route continues that path",
+            text)
         self.assertNotIn("no longer offered", text)
 
-    def test_plan_line_when_route_not_offered(self):
-        text = loop.render_state(make_route_turn(routes=[DETOUR], tick=8), PLAN)
-        self.assertIn(
-            "current plan: enemy_flag_direct (goal enemy_flag) since tick 5 \u2014 that route is no longer offered", text)
+    def test_plan_line_without_known_path(self):
+        text = loop.render_state(make_route_turn(tick=8), PLAN)
+        self.assertIn("current plan: goal enemy_flag since tick 5", text)
+        self.assertNotIn("heading to", text)
 
     def test_plan_wording_is_neutral(self):
-        text = loop.render_state(make_route_turn(tick=8), PLAN).lower()
+        text = loop.render_state(reg_turn(), reg_plan()).lower()
         for word in ("recommend", "should"):
             self.assertNotIn(word, text)
 
@@ -442,24 +567,58 @@ class TestBuildOptionsPlan(unittest.TestCase):
     def test_no_plan_unchanged(self):
         turn = make_route_turn()
         self.assertEqual(loop.build_options(turn, None), loop.build_options(turn))
+        self.assertEqual(loop.build_options(turn, loop.Plan()), loop.build_options(turn))
 
-    def test_matching_route_annotated_as_continuing(self):
-        opts = loop.build_options(make_route_turn(tick=8), PLAN)
-        self.assertTrue(opts["enemy_flag_direct"].endswith(" | continues your current plan (3 ticks)"))
+    def test_regression_backwards_detour_is_not_a_continuation(self):
+        opts = loop.build_options(reg_turn(), reg_plan())
+        self.assertTrue(opts["enemy_flag_direct"].endswith(" | continues your current path (1 tick)"))
+        self.assertTrue(opts["enemy_flag_detour"].endswith(" | same goal as your current plan, different path"))
+        self.assertNotIn("continues", opts["enemy_flag_detour"])
 
-    def test_same_goal_other_route_annotated(self):
-        opts = loop.build_options(make_route_turn(tick=8), PLAN)
-        self.assertTrue(opts["enemy_flag_detour"].endswith(" | same goal as your current plan, different route"))
+    def test_same_id_does_not_imply_continuation(self):
+        # The direct route now goes backwards; only the differently named route continues the path.
+        direct = path_route("enemy_flag_direct", "enemy_flag", [(2, 7), (2, 6)], first_step="left")
+        other = path_route("enemy_flag_alt", "enemy_flag", [(x, 7) for x in range(4, 12)])
+        opts = loop.build_options(reg_turn(routes=[direct, other]), reg_plan())
+        self.assertIn("different path", opts["enemy_flag_direct"])
+        self.assertIn("continues your current path", opts["enemy_flag_alt"])
+
+    def test_blocked_move_case(self):
+        # I did not move: still at (2,7); the route that starts with the previous path continues.
+        direct = path_route("enemy_flag_direct", "enemy_flag", list(PREV_PATH))
+        detour = path_route("enemy_flag_detour", "enemy_flag", [(1, 7), (0, 7)], first_step="left")
+        opts = loop.build_options(reg_turn(me=(2, 7), tick=6, routes=[direct, detour]), reg_plan())
+        self.assertIn("continues your current path", opts["enemy_flag_direct"])
+        self.assertIn("different path", opts["enemy_flag_detour"])
+
+    def test_respawn_case_nothing_continues(self):
+        direct = path_route("enemy_flag_direct", "enemy_flag", [(13, 7), (12, 7)], first_step="left")
+        opts = loop.build_options(reg_turn(me=(14, 7), tick=9, routes=[direct]), reg_plan())
+        self.assertNotIn("continues", opts["enemy_flag_direct"])
+        self.assertIn("different path", opts["enemy_flag_direct"])
+
+    def test_multiple_routes_can_continue(self):
+        a = path_route("a_route", "enemy_flag", [(x, 7) for x in range(4, 12)])
+        b = path_route("b_route", "enemy_flag", [(4, 7), (5, 7), (5, 8)])  # diverges after 2 cells -> no
+        c = path_route("c_route", "enemy_flag", [(x, 7) for x in range(4, 8)])
+        opts = loop.build_options(reg_turn(routes=[a, b, c]), reg_plan())
+        self.assertIn("continues your current path", opts["a_route"])
+        self.assertIn("different path", opts["b_route"])
+        self.assertIn("continues your current path", opts["c_route"])
+
+    def test_zero_routes_continue(self):
+        opts = loop.build_options(reg_turn(routes=[reg_turn()["state"]["routes"][1]]), reg_plan())
+        self.assertNotIn("continues", " ".join(opts.values()))
 
     def test_other_goals_and_wait_unchanged(self):
-        turn = make_route_turn(routes=[DETOUR, DIRECT, TAG_FAR], tick=8)
-        base, opts = loop.build_options(turn), loop.build_options(turn, PLAN)
+        turn = reg_turn(routes=reg_turn()["state"]["routes"] + [TAG_FAR])
+        base, opts = loop.build_options(turn), loop.build_options(turn, reg_plan())
         self.assertEqual(opts["tag:blue-1"], base["tag:blue-1"])
         self.assertEqual(opts["wait"], base["wait"])
 
     def test_labels_and_order_unchanged(self):
-        turn = make_route_turn(tick=8)
-        self.assertEqual(list(loop.build_options(turn, PLAN)), list(loop.build_options(turn)))
+        turn = reg_turn()
+        self.assertEqual(list(loop.build_options(turn, reg_plan())), list(loop.build_options(turn)))
 
 
 class TestExecutedRouteInference(unittest.TestCase):
@@ -536,6 +695,13 @@ class TestActionText(unittest.TestCase):
         self.assertIn("current plan", loop.DECIDER_INSTRUCTIONS)
         self.assertIn("current plan", loop.LLM_PLAN_NOTE)
         self.assertNotIn("should", loop.DECIDER_INSTRUCTIONS.split("Your current plan")[1])
+
+    def test_instructions_explain_route_ids_are_recomputed_neutrally(self):
+        for text in (loop.DECIDER_INSTRUCTIONS, loop.LLM_PLAN_NOTE):
+            self.assertIn("continue your current path", text)
+            self.assertIn("recomputed every tick", text)
+            self.assertNotIn("switching routes every tick", text)
+            self.assertNotIn("recommend", text.lower())
 
 
 class TestRemainingMs(unittest.TestCase):
@@ -618,6 +784,302 @@ class TestStatsBudget(unittest.TestCase):
         stats = loop.Stats()
         stats.budget_ticks = 3
         self.assertIn("by budget: 3", stats.summary())
+
+
+class TestStatsTimeouts(unittest.TestCase):
+    def test_summary_includes_llm_timeouts(self):
+        stats = loop.Stats()
+        stats.llm_timeouts = 2
+        self.assertIn("by budget: 0, LLM timeouts: 2,", stats.summary())
+
+
+class TestLlmTimeoutS(unittest.TestCase):
+    def test_remaining_minus_margin_in_seconds(self):
+        self.assertAlmostEqual(loop.llm_timeout_s(5000, 300), 4.7)
+
+    def test_clamped_to_minimum(self):
+        self.assertEqual(loop.llm_timeout_s(100, 300), 0.05)
+        self.assertEqual(loop.llm_timeout_s(-50, 300), 0.05)
+
+
+class TestTimeoutAction(unittest.TestCase):
+    OPTIONS = {"enemy_flag_direct": "d", "wait": "w"}
+
+    def act(self, chosen="enemy_flag_direct", down=False, acted=False, options=None):
+        return loop.timeout_action(chosen, self.OPTIONS if options is None else options, down, acted)
+
+    def test_valid_choice_runs_decider(self):
+        self.assertEqual(self.act(), "decider")
+
+    def test_invalid_or_missing_choice_waits(self):
+        self.assertEqual(self.act(chosen="nope"), "wait")
+        self.assertEqual(self.act(chosen=None), "wait")
+
+    def test_decider_down_waits(self):
+        self.assertEqual(self.act(down=True), "wait")
+
+    def test_already_acted_does_nothing(self):
+        self.assertEqual(self.act(acted=True), "none")
+        self.assertEqual(self.act(acted=True, down=True, chosen=None), "none")
+
+
+class FakeToolEvent:
+    def __init__(self, name="move", tool_input=None):
+        self.tool_use = {"name": name, "input": tool_input or {"direction": "up", "tick": 3}}
+
+
+class TestTickCancelHandler(unittest.TestCase):
+    def setUp(self):
+        from strands.interventions import Deny, Proceed
+        self.Deny, self.Proceed = Deny, Proceed
+        self.cancel = threading.Event()
+        self.handler = loop.TickCancelHandler(self.cancel)
+
+    def test_proceeds_before_cancel_and_records_action(self):
+        self.assertIsInstance(self.handler.before_tool_call(FakeToolEvent("move")), self.Proceed)
+        self.assertTrue(self.handler.executed_action)
+
+    def test_non_action_tool_does_not_record(self):
+        self.assertIsInstance(self.handler.before_tool_call(FakeToolEvent("get_rules")), self.Proceed)
+        self.assertFalse(self.handler.executed_action)
+
+    def test_denies_after_cancel_without_recording(self):
+        self.cancel.set()
+        decision = self.handler.before_tool_call(FakeToolEvent("move"))
+        self.assertIsInstance(decision, self.Deny)
+        self.assertEqual(decision.reason, "tick timed out")
+        self.assertFalse(self.handler.executed_action)
+
+    def test_is_an_intervention_handler_with_a_name(self):
+        from strands.interventions import InterventionHandler
+        self.assertIsInstance(self.handler, InterventionHandler)
+        self.assertTrue(self.handler.name)
+
+
+class TestRunWithTimeout(unittest.TestCase):
+    def test_slow_callable_times_out_quickly(self):
+        started = time.monotonic()
+        timed_out, value = loop.run_with_timeout(lambda: time.sleep(0.3) or "late", 0.05)
+        self.assertLess(time.monotonic() - started, 0.25)
+        self.assertTrue(timed_out)
+        self.assertIsNone(value)
+
+    def test_fast_callable_returns_value(self):
+        self.assertEqual(loop.run_with_timeout(lambda: 42, 1.0), (False, 42))
+
+    def test_exceptions_propagate(self):
+        def boom():
+            raise RuntimeError("x")
+        with self.assertRaises(RuntimeError):
+            loop.run_with_timeout(boom, 1.0)
+
+
+class FakeHookRegistry:
+    def __init__(self):
+        self.callbacks = []
+
+    def add_callback(self, event_type, callback, **kwargs):
+        self.callbacks.append((event_type, callback))
+
+
+class FakeAfterToolsEvent:
+    def __init__(self):
+        self.end_turn = False
+
+
+class FakeAfterToolCallEvent:
+    def __init__(self, name="move", cancel_message=None):
+        self.tool_use = {"name": name, "input": {}}
+        self.cancel_message = cancel_message
+
+
+class TestStopAfterActionHook(unittest.TestCase):
+    """After one action tool completes, the event loop must end the turn (no second model call)."""
+
+    def setUp(self):
+        self.hook = loop.StopAfterActionHook()
+
+    def run_batch(self, *calls):
+        for call in calls:
+            self.hook.after_tool_call(call)
+        done = FakeAfterToolsEvent()
+        self.hook.after_tools(done)
+        return done
+
+    def test_ends_turn_after_an_action_tool(self):
+        self.assertTrue(self.run_batch(FakeAfterToolCallEvent("move")).end_turn)
+
+    def test_every_action_tool_ends_the_turn(self):
+        for name in loop.ACTION_TOOLS:
+            self.setUp()
+            self.assertTrue(self.run_batch(FakeAfterToolCallEvent(name)).end_turn, name)
+
+    def test_does_not_end_turn_after_non_action_tool(self):
+        self.assertFalse(self.run_batch(FakeAfterToolCallEvent("get_rules")).end_turn)
+
+    def test_does_not_end_turn_without_any_tool_call(self):
+        self.assertFalse(self.run_batch().end_turn)
+
+    def test_cancelled_action_does_not_end_turn(self):
+        self.assertFalse(self.run_batch(FakeAfterToolCallEvent("move", cancel_message="tick timed out")).end_turn)
+
+    def test_registers_both_callbacks_on_the_real_event_types(self):
+        from strands.hooks import AfterToolCallEvent, AfterToolsEvent
+        registry = FakeHookRegistry()
+        self.hook.register_hooks(registry)
+        self.assertEqual({t for t, _ in registry.callbacks}, {AfterToolCallEvent, AfterToolsEvent})
+
+    def test_real_event_allows_writing_end_turn(self):
+        from strands.hooks import AfterToolsEvent
+        event = AfterToolsEvent(agent=None, message={"role": "user", "content": []}, invocation_state={})
+        self.hook.after_tool_call(FakeAfterToolCallEvent("move"))
+        self.hook.after_tools(event)
+        self.assertTrue(event.end_turn)
+
+
+class FakeThread:
+    def __init__(self, name, daemon, alive=True):
+        self.name, self.daemon, self._alive = name, daemon, alive
+
+    def is_alive(self):
+        return self._alive
+
+
+class TestLingeringThreads(unittest.TestCase):
+    def test_only_alive_non_daemon_non_main_threads(self):
+        main = threading.main_thread()
+        threads = [main, FakeThread("a", daemon=True), FakeThread("b", daemon=False),
+                   FakeThread("c", daemon=False, alive=False)]
+        self.assertEqual([t.name for t in loop.lingering_threads(threads)], ["b"])
+
+    def test_describe_lists_names_and_daemon_flags(self):
+        text = loop.describe_threads([FakeThread("worker", False), FakeThread("llm-tick", True)])
+        self.assertIn("worker (daemon=False)", text)
+        self.assertIn("llm-tick (daemon=True)", text)
+
+
+class TestExitIfThreadsLinger(unittest.TestCase):
+    def call(self, threads, code=0, grace_s=2.0):
+        self.exits, self.log = [], []
+        clock = {"t": 0.0}
+
+        def sleep(seconds):
+            clock["t"] += seconds
+
+        return loop.exit_if_threads_linger(
+            code, grace_s, exit_fn=self.exits.append, enumerate_fn=lambda: threads,
+            sleep=sleep, clock=lambda: clock["t"], log=self.log.append)
+
+    def test_no_exit_when_only_daemon_threads(self):
+        self.assertFalse(self.call([threading.main_thread(), FakeThread("d", True)]))
+        self.assertEqual(self.exits, [])
+
+    def test_force_exits_with_code_when_non_daemon_thread_survives_grace(self):
+        self.assertTrue(self.call([FakeThread("stuck", False)], code=3))
+        self.assertEqual(self.exits, [3])
+        self.assertIn("stuck (daemon=False)", "\n".join(self.log))
+
+    def test_no_exit_when_thread_finishes_within_grace(self):
+        thread = FakeThread("slow", False)
+        calls = {"n": 0}
+
+        def enumerate_fn():
+            calls["n"] += 1
+            thread._alive = calls["n"] < 3
+            return [thread]
+
+        exits, clock = [], {"t": 0.0}
+
+        def sleep(seconds):
+            clock["t"] += seconds
+
+        result = loop.exit_if_threads_linger(0, 2.0, exit_fn=exits.append, enumerate_fn=enumerate_fn,
+                                             sleep=sleep, clock=lambda: clock["t"], log=lambda m: None)
+        self.assertFalse(result)
+        self.assertEqual(exits, [])
+
+
+class TestRunGuarded(unittest.TestCase):
+    def run_it(self, fn):
+        import contextlib
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            return loop.run_guarded(fn), err.getvalue()
+
+    def test_returns_function_code(self):
+        self.assertEqual(self.run_it(lambda: 0)[0], 0)
+
+    def test_exception_prints_traceback_and_returns_nonzero(self):
+        def boom():
+            raise RuntimeError("kaput")
+        code, err = self.run_it(boom)
+        self.assertEqual(code, 1)
+        self.assertIn("RuntimeError: kaput", err)
+        self.assertIn("Traceback", err)
+
+    def test_keyboard_interrupt_returns_130(self):
+        def interrupted():
+            raise KeyboardInterrupt
+        self.assertEqual(self.run_it(interrupted)[0], 130)
+
+    def test_system_exit_code_is_preserved(self):
+        def exits():
+            raise SystemExit(2)
+        self.assertEqual(self.run_it(exits)[0], 2)
+
+    def test_system_exit_none_is_zero(self):
+        def exits():
+            raise SystemExit()
+        self.assertEqual(self.run_it(exits)[0], 0)
+
+
+class FakeLifecycleClient:
+    def __init__(self, start_error=None):
+        self.events, self.start_error = [], start_error
+
+    def start(self):
+        self.events.append("start")
+        if self.start_error:
+            raise self.start_error
+        return self
+
+    def stop(self, *exc):
+        self.events.append("stop")
+
+
+class TestWithClient(unittest.TestCase):
+    def test_stops_on_normal_exit(self):
+        client = FakeLifecycleClient()
+        self.assertEqual(loop.with_client(client, lambda: "ok"), "ok")
+        self.assertEqual(client.events, ["start", "stop"])
+
+    def test_stops_when_body_raises(self):
+        client = FakeLifecycleClient()
+        with self.assertRaises(RuntimeError):
+            loop.with_client(client, lambda: (_ for _ in ()).throw(RuntimeError("x")))
+        self.assertEqual(client.events, ["start", "stop"])
+
+    def test_stops_on_keyboard_interrupt(self):
+        client = FakeLifecycleClient()
+
+        def interrupted():
+            raise KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            loop.with_client(client, interrupted)
+        self.assertEqual(client.events, ["start", "stop"])
+
+    def test_stops_even_when_start_fails(self):
+        client = FakeLifecycleClient(start_error=OSError("no server"))
+        with self.assertRaises(OSError):
+            loop.with_client(client, lambda: None)
+        self.assertEqual(client.events, ["start", "stop"])
+
+    def test_stop_failure_does_not_mask_body_error(self):
+        client = FakeLifecycleClient()
+        client.stop = lambda *a: (_ for _ in ()).throw(RuntimeError("stop failed"))
+        with self.assertRaises(ValueError):
+            loop.with_client(client, lambda: (_ for _ in ()).throw(ValueError("body")))
 
 
 class TestArgs(unittest.TestCase):

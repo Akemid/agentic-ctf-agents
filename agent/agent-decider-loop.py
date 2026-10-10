@@ -43,13 +43,17 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
+import traceback
 import uuid
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 from _client import Decider, ServerUnavailable
 from strands import Agent
+from strands.hooks import AfterToolCallEvent, AfterToolsEvent
+from strands.interventions import Deny, InterventionHandler, Proceed
 from strands.tools.mcp import MCPClient
 
 # ---------------------------------------------------------------------------
@@ -89,6 +93,7 @@ MAX_CONSECUTIVE_TOOL_ERRORS = 5
 DEFAULT_DEADLINE_MS = 5000
 DEFAULT_LLM_BUDGET_MS = 4500
 DEFAULT_SAFETY_MARGIN_MS = 300
+EXIT_GRACE_S = 2.0
 
 DECIDER_LOCK_FILE = os.path.join(tempfile.gettempdir(), "strands-decider.lock")
 
@@ -98,13 +103,15 @@ DECIDER_INSTRUCTIONS = (
     "are routes offered by the server: choose between them by weighing length, whether "
     "they are blocked right now, and the risk of being tagged along the way. Tag enemies "
     "inside your own field when it helps, and defend your flag when it is threatened. "
-    "Your current plan, if any, is shown; switching routes every tick can undo your own "
-    "progress. Keep or change it based on the current situation."
+    "Your current plan, if any, is shown, and routes that continue your current path are "
+    "marked; route ids are recomputed every tick and do not mean the same path from one tick "
+    "to the next. Keep or change the plan based on the current situation."
 )
 
 LLM_PLAN_NOTE = (
-    "Your current plan, if any, is shown; switching routes every tick can undo your own "
-    "progress. Keep or change it based on the current situation. When you call move or tag "
+    "Your current plan, if any, is shown, and routes that continue your current path are "
+    "marked; route ids are recomputed every tick and do not mean the same path from one tick "
+    "to the next. Keep or change the plan based on the current situation. When you call move or tag "
     "for a route, set `rationale` to `route <route_id>` (e.g. `route enemy_flag_direct`)."
 )
 
@@ -205,32 +212,97 @@ def _routes(state: dict[str, Any]) -> list[dict[str, Any]]:
     return [r for r in routes if isinstance(r, dict) and isinstance(r.get("id"), str)] if isinstance(routes, list) else []
 
 
+Cell = tuple[int, int]
+
+
 @dataclass
 class Plan:
-    """Loop-owned memory of the route the agent last acted on. Informational only: the
-    model still decides every tick and may keep or change it."""
+    """Loop-owned memory of the path the agent last acted on. Informational only: the model
+    still decides every tick and may keep or change it.
+
+    Route ids are recomputed by the server every tick, so continuity is judged by `path` (the
+    executed route's path when it was chosen) and `position` (where the agent stood then).
+    `route_id` is kept for display and logging only.
+    """
 
     route_id: str | None = None
     goal: str | None = None
     since_tick: int | None = None
     last_action: str | None = None
+    path: tuple[Cell, ...] | None = None
+    position: Cell | None = None
+
+
+def _cells(path: Any) -> tuple[Cell, ...] | None:
+    """Normalise a path (cells as tuples or {x, y} dicts) to a tuple of tuples; None if malformed/empty."""
+    if not isinstance(path, (list, tuple)) or not path:
+        return None
+    cells: list[Cell] = []
+    for cell in path:
+        if isinstance(cell, dict):
+            cell = _xy(cell)
+        if (not isinstance(cell, (list, tuple)) or len(cell) != 2
+                or not all(isinstance(v, int) and not isinstance(v, bool) for v in cell)):
+            return None
+        cells.append((cell[0], cell[1]))
+    return tuple(cells)
+
+
+def _same_prefix(expected: tuple[Cell, ...], route: tuple[Cell, ...]) -> bool:
+    """True when both agree on their overlapping prefix (both may be truncated); needs >= 1 cell."""
+    overlap = min(len(expected), len(route))
+    return overlap >= 1 and expected[:overlap] == route[:overlap]
+
+
+def continues_path(prev_path: Any, prev_position: Any, my_position: Any, route_path: Any) -> bool:
+    """Whether `route_path` (from `my_position`) continues the previously executed path (pure).
+
+    Moved one step along the previous path: the route must start with the rest of that path.
+    Did not move (e.g. move_blocked): the route must start with the previous path again.
+    Anything else (respawned, tagged, moved elsewhere) or malformed input: False.
+    """
+    prev, route = _cells(prev_path), _cells(route_path)
+    here, before = _cells([my_position]), _cells([prev_position])
+    if prev is None or route is None or here is None:
+        return False
+    here_cell = here[0]
+    if here_cell == prev[0] and (before is None or before[0] != here_cell):
+        return _same_prefix(prev[1:], route)
+    if before is not None and here_cell == before[0]:
+        return _same_prefix(prev, route)
+    return False
+
+
+def route_continues_plan(plan: Plan | None, my_position: Cell | None, route: dict[str, Any]) -> bool:
+    """Whether an offered route's path continues the plan's stored path."""
+    return plan is not None and continues_path(plan.path, plan.position, my_position, route.get("path"))
+
+
+def route_path(turn: dict[str, Any], route_id: str | None) -> tuple[Cell, ...] | None:
+    """Path of the offered route with this id, if any."""
+    route = next((r for r in _routes(_state(turn)) if r["id"] == route_id), None)
+    return _cells(route.get("path")) if route else None
 
 
 def update_plan(plan: Plan, executed_route_id: str | None, executed_goal: str | None,
-                action_text: str, tick: int) -> Plan:
+                action_text: str, tick: int, executed_path: Any = None,
+                position: Cell | None = None) -> Plan:
     """New plan after an executed action (pure).
 
-    A route action keeps `since_tick` while the goal is unchanged (the route id may change
-    within a goal) and restarts it on a new goal. `grab_flag` clears the plan; any other
-    non-route action (e.g. `wait`) only records `last_action`.
+    A route action keeps `since_tick` only while the goal is unchanged AND the executed route's
+    path continues the plan's path (the route id is irrelevant: ids are recomputed every tick).
+    Otherwise it starts a new plan at this tick. `position` is where the agent stood when
+    acting. `grab_flag` clears the plan; any other non-route action (e.g. `wait`) only records
+    `last_action`.
     """
     if executed_route_id is None:
         if action_text.split(" ", 1)[0] == "grab_flag":
             return Plan(last_action=action_text)
         return replace(plan, last_action=action_text)
-    same_goal = plan.route_id is not None and plan.goal == executed_goal and plan.since_tick is not None
-    since = plan.since_tick if same_goal else tick
-    return Plan(executed_route_id, executed_goal, since, action_text)
+    keeps = (plan.since_tick is not None and plan.goal is not None and plan.goal == executed_goal
+             and continues_path(plan.path, plan.position, position, executed_path))
+    since = plan.since_tick if keeps else tick
+    return Plan(executed_route_id, executed_goal, since, action_text, _cells(executed_path), position)
 
 
 def plan_suffix(plan: Plan) -> str:
@@ -335,7 +407,8 @@ def build_options(turn: dict[str, Any], plan: Plan | None = None) -> dict[str, s
 
     One option per server route (label = route id). Without routes, falls back to one
     `move_<dir>` option per open direction (and adjacent tags). No option is ever recommended.
-    With a `plan`, the matching route and other routes with the same goal get a neutral note.
+    With a `plan`, every route whose path continues the plan's path gets a neutral note, and
+    other routes with the same goal are marked as a different path.
     """
     state = _state(turn)
     me, team = _my_position(state), _my_team(state)
@@ -344,11 +417,11 @@ def build_options(turn: dict[str, Any], plan: Plan | None = None) -> dict[str, s
     routes = _routes(state)
     for route in routes:
         text = describe_route(route)
-        if plan is not None and plan.route_id:
-            if route["id"] == plan.route_id:
-                text += f" | continues your current plan ({_plural(_plan_age(turn, plan), 'tick')})"
+        if _plan_active(plan):
+            if route_continues_plan(plan, me, route):
+                text += f" | continues your current path ({_plural(_plan_age(turn, plan), 'tick')})"
             elif plan.goal is not None and route.get("goal") == plan.goal:
-                text += " | same goal as your current plan, different route"
+                text += " | same goal as your current plan, different path"
         options[route["id"]] = text
     if not routes:
         for direction in _open_directions(state):
@@ -387,9 +460,13 @@ def label_to_call(label: str, tick: int, turn: dict[str, Any] | None = None) -> 
         first_step = route.get("first_step")
         if first_step in DIRECTIONS:
             return "move", {"direction": first_step, "tick": tick, "rationale": rationale}
-        enemy_id = _route_enemy_id(route)
-        if enemy_id and route.get("length") == 0:
-            return "tag", {"enemy_id": enemy_id, "tick": tick, "rationale": rationale}
+        if route.get("length") == 0:  # already on the route's target (first_step is null)
+            enemy_id = _route_enemy_id(route)
+            if enemy_id:
+                return "tag", {"enemy_id": enemy_id, "tick": tick, "rationale": rationale}
+            if route.get("goal") == "enemy_flag":
+                return "grab_flag", {"tick": tick, "rationale": rationale}
+            return "wait", {"tick": tick, "rationale": rationale}  # own_base / defend_flag: stay put
     raise ValueError(f"unknown option label: {label!r}")
 
 
@@ -446,6 +523,110 @@ def choose_path(chosen: str | None, confidence: float, threshold: float, options
     if not decider_down and valid:
         return "budget"
     return "wait"
+
+
+MIN_LLM_TIMEOUT_S = 0.05
+
+
+def llm_timeout_s(remaining: float, margin_ms: float) -> float:
+    """Seconds the LLM fallback may run: time left minus the safety margin, at least 50 ms (pure)."""
+    return max(MIN_LLM_TIMEOUT_S, (remaining - margin_ms) / 1000)
+
+
+def timeout_action(chosen: str | None, options: dict[str, str], decider_down: bool,
+                   already_acted: bool) -> Literal["decider", "wait", "none"]:
+    """What to send when the LLM fallback timed out (pure).
+
+    none: the LLM already executed an action, never send a second one.
+    decider: the decider's choice is a valid offered option. wait: nothing valid to run.
+    """
+    if already_acted:
+        return "none"
+    if not decider_down and chosen is not None and chosen in options:
+        return "decider"
+    return "wait"
+
+
+class TickCancelHandler(InterventionHandler):
+    """Blocks action tools once the tick's cancel event is set (the LLM timed out).
+
+    An abandoned LLM thread may still try to act later; its action would be rejected as late
+    or, worse, double the one we already sent. `executed_action` records that an action tool
+    was allowed through before the cancel, so the timeout path can avoid a second action.
+    """
+
+    name = "tick-cancel"
+
+    def __init__(self, cancel: threading.Event) -> None:
+        self.cancel = cancel
+        self.executed_action = False
+        self._lock = threading.Lock()
+
+    def before_tool_call(self, event: Any, **kwargs: Any) -> Proceed | Deny:
+        with self._lock:  # check-and-record is atomic with respect to the timeout path
+            if self.cancel.is_set():
+                return Deny(reason="tick timed out")
+            if (getattr(event, "tool_use", None) or {}).get("name") in ACTION_TOOLS:
+                self.executed_action = True
+            return Proceed()
+
+    def cancel_tick(self) -> bool:
+        """Set the cancel event; True when the LLM had already been allowed to act."""
+        with self._lock:
+            self.cancel.set()
+            return self.executed_action
+
+
+class StopAfterActionHook:
+    """Ends the Agent's turn right after an action tool completes (no second model call).
+
+    VERIFIED (strands 1.59): `AfterToolsEvent.end_turn` (hooks/events.py) makes the event loop halt
+    after the tool batch without calling the model again (event_loop/event_loop.py, "Hook requested
+    halt"). Interventions cannot do this (`after_tool_call` only allows Proceed/Transform), and the
+    `request_state["stop_event_loop"]` flag is only reachable from inside a tool. `AfterToolsEvent`
+    carries tool results without names, so `AfterToolCallEvent` records that an action tool ran.
+    A cancelled call (denied by TickCancelHandler) does not count as an action.
+    """
+
+    def __init__(self) -> None:
+        self.acted = False
+
+    def register_hooks(self, registry: Any, **kwargs: Any) -> None:
+        registry.add_callback(AfterToolCallEvent, self.after_tool_call)
+        registry.add_callback(AfterToolsEvent, self.after_tools)
+
+    def after_tool_call(self, event: Any) -> None:
+        if (getattr(event, "tool_use", None) or {}).get("name") in ACTION_TOOLS and not getattr(event, "cancel_message", None):
+            self.acted = True
+
+    def after_tools(self, event: Any) -> None:
+        if self.acted:
+            event.end_turn = "action sent"
+
+
+def run_with_timeout(fn, timeout_s: float) -> tuple[bool, Any]:
+    """Run `fn` in a daemon thread and wait at most `timeout_s`. Returns (timed_out, result).
+
+    On timeout the thread is abandoned (it cannot be killed) and (True, None) is returned.
+    An exception raised by `fn` is re-raised in the caller. A fresh thread per call means an
+    abandoned run never blocks the next tick.
+    """
+    box: dict[str, Any] = {}
+
+    def target() -> None:
+        try:
+            box["value"] = fn()
+        except BaseException as exc:  # noqa: BLE001 - re-raised in the caller
+            box["error"] = exc
+
+    thread = threading.Thread(target=target, daemon=True, name="llm-tick")
+    thread.start()
+    thread.join(timeout_s)
+    if thread.is_alive():
+        return True, None
+    if "error" in box:
+        raise box["error"]
+    return False, box.get("value")
 
 
 def warmup_question() -> tuple[str, dict[str, dict[str, Any]]]:
@@ -522,10 +703,16 @@ def _plan_age(turn: dict[str, Any], plan: Plan) -> int:
     return max(0, extract_tick(turn) - plan.since_tick)
 
 
+def _plan_active(plan: Plan | None) -> bool:
+    return plan is not None and bool(plan.route_id or plan.goal)
+
+
 def _plan_line(turn: dict[str, Any], plan: Plan) -> str:
-    head = f"current plan: {plan.route_id} (goal {plan.goal}) since tick {plan.since_tick}"
-    if plan.route_id not in {r["id"] for r in _routes(_state(turn))}:
-        return f"{head} \u2014 that route is no longer offered"
+    target = f", heading to {plan.path[-1]}" if plan.path else ""
+    head = f"current plan: goal {plan.goal}{target} since tick {plan.since_tick}"
+    me = _my_position(_state(turn))
+    if not any(route_continues_plan(plan, me, r) for r in _routes(_state(turn))):
+        return f"{head} \u2014 no offered route continues that path"
     line = f"{head}, {_plural(_plan_age(turn, plan), 'tick')}"
     return f"{line}; last action: {plan.last_action}" if plan.last_action else line
 
@@ -545,7 +732,7 @@ def render_state(turn: dict[str, Any], plan: Plan | None = None) -> str:
             where = "in the enemy field"
         lines.append(f"you: {state.get('self')} ({_my_team(state)}) at {me}, {where}")
     lines.append(f"carrying the flag: {'yes' if _carrying(state) else 'no'}")
-    if plan is not None and plan.route_id:
+    if _plan_active(plan):
         lines.append(_plan_line(turn, plan))
 
     score = state.get("score")
@@ -593,13 +780,14 @@ class Stats:
         self.decider_ticks = 0
         self.llm_ticks = 0
         self.budget_ticks = 0
+        self.llm_timeouts = 0
         self.latencies_ms: list[float] = []
 
     def summary(self) -> str:
         avg = f"{sum(self.latencies_ms) / len(self.latencies_ms):.0f} ms" if self.latencies_ms else "n/a"
         return (
             f"ticks decided by decider: {self.decider_ticks}, by LLM fallback: {self.llm_ticks}, "
-            f"by budget: {self.budget_ticks}, "
+            f"by budget: {self.budget_ticks}, LLM timeouts: {self.llm_timeouts}, "
             f"decider avg latency: {avg}"
         )
 
@@ -623,8 +811,9 @@ def join(client: MCPClient, match: str, name: str) -> str:
     raise RuntimeError(f"could not join match {match} on either team")
 
 
-def run_llm_tick(agent_factory, state: str, tick: int) -> tuple[int, tuple[str, dict[str, Any]] | None]:
-    """Run the fallback Agent for one tick (a fresh agent each time).
+def run_llm_tick(agent_factory, state: str, tick: int,
+                 handler: InterventionHandler | None = None) -> tuple[int, tuple[str, dict[str, Any]] | None]:
+    """Run the fallback Agent for one tick (a fresh agent each time, guarded by `handler`).
 
     Returns (how many action tools it called, the (tool name, input) it executed or None).
     """
@@ -633,7 +822,7 @@ def run_llm_tick(agent_factory, state: str, tick: int) -> tuple[int, tuple[str, 
         f"exactly one action tool ({', '.join(ACTION_TOOLS)}) with tick={tick}: move with the "
         "route's first step, tag with the enemy id, grab_flag, or wait.\n" + LLM_PLAN_NOTE
     )
-    agent = agent_factory()
+    agent = agent_factory(handler)
     result = agent(prompt)
     tool_metrics = getattr(getattr(result, "metrics", None), "tool_metrics", {}) or {}
     calls = sum(getattr(m, "call_count", 0) for m in tool_metrics.values())
@@ -660,11 +849,13 @@ def play(client: MCPClient, decider: Decider, args: argparse.Namespace) -> Stats
     plan = Plan()
 
     action_tools = [t for t in client.list_tools_sync() if t.tool_name in ACTION_TOOLS]
-    agent_factory = lambda: Agent(  # noqa: E731
+    agent_factory = lambda handler: Agent(  # noqa: E731
         model=MODELS[args.model],
         tools=action_tools,
         system_prompt=SYSTEM_PROMPT,
         callback_handler=None,
+        interventions=[handler] if handler is not None else [],
+        hooks=[StopAfterActionHook()],  # end the turn after the action: no wasted 2nd model call
     )
 
     if not args.no_warmup and not warm_up(decider):
@@ -718,10 +909,16 @@ def play(client: MCPClient, decider: Decider, args: argparse.Namespace) -> Stats
                            args.llm_budget_ms, args.safety_margin_ms, decider_down)
 
         if path in ("decider", "budget"):
-            tool, arguments = label_to_call(chosen, tick, turn)
+            try:
+                tool, arguments = label_to_call(chosen or "", tick, turn)
+            except ValueError as exc:
+                # Never crash mid-match on an option we cannot map: a wait beats a dead agent.
+                print(f"[tick {tick}] {exc} -> wait")
+                tool, arguments = "wait", {"tick": tick}
             outcome = call_tool(client, tool, arguments)
             route_id = chosen if route_goal(turn, chosen) is not None else None
-            plan = update_plan(plan, route_id, route_goal(turn, route_id), describe_action(tool, arguments), tick)
+            plan = update_plan(plan, route_id, route_goal(turn, route_id), describe_action(tool, arguments), tick,
+                               route_path(turn, route_id), _my_position(_state(turn)))
             if path == "decider":
                 stats.decider_ticks += 1
                 print(f"[tick {tick}] decider -> {chosen} (confidence {confidence:.2f}){plan_suffix(plan)}")
@@ -749,14 +946,46 @@ def play(client: MCPClient, decider: Decider, args: argparse.Namespace) -> Stats
         print(f"[tick {tick}] LLM fallback: {reason}")
         stats.llm_ticks += 1
         llm_started = time.monotonic()
-        calls, call = run_llm_tick(agent_factory, state, tick)
+        limit_ms = llm_timeout_s(turn_remaining_ms(turn, (llm_started - turn_received) * 1000),
+                                 args.safety_margin_ms) * 1000
+        handler = TickCancelHandler(threading.Event())
+        timed_out, llm_result = run_with_timeout(
+            lambda: run_llm_tick(agent_factory, state, tick, handler), limit_ms / 1000)
+        if timed_out:
+            already_acted = handler.cancel_tick()  # BEFORE any fallback action
+            stats.llm_ticks -= 1
+            stats.llm_timeouts += 1
+            waited = f"[tick {tick}] LLM timeout after {(time.monotonic() - llm_started) * 1000:.0f} ms (limit {limit_ms:.0f} ms)"
+            action = timeout_action(chosen, options, decider_down, already_acted)
+            if action == "none":
+                print(f"{waited} -> LLM already executed an action, not sending another")
+                continue
+            if action == "decider":
+                try:
+                    tool, arguments = label_to_call(chosen or "", tick, turn)
+                except ValueError as exc:
+                    print(f"[tick {tick}] {exc} -> wait")
+                    action, tool, arguments = "wait", "wait", {"tick": tick}
+            else:
+                tool, arguments = "wait", {"tick": tick}
+            outcome = call_tool(client, tool, arguments)
+            route_id = chosen if action == "decider" and route_goal(turn, chosen) is not None else None
+            plan = update_plan(plan, route_id, route_goal(turn, route_id), describe_action(tool, arguments), tick,
+                               route_path(turn, route_id), _my_position(_state(turn)))
+            verdict = f"executing decider choice {chosen} ({confidence:.2f})" if action == "decider" else "wait"
+            print(f"{waited} -> {verdict}{plan_suffix(plan)}")
+            if outcome["_is_error"]:
+                print(f"    action error: {outcome}")
+            continue
+        calls, call = llm_result
         print(f"[tick {tick}] timing: LLM wall {(time.monotonic() - llm_started) * 1000:.0f} ms, "
               f"total since turn {(time.monotonic() - turn_received) * 1000:.0f} ms")
         if calls == 0:
             print("    warning: the LLM made no action call; the server will count this tick as wait")
         if call is not None:
             route_id = infer_executed_route(call, turn, plan)
-            plan = update_plan(plan, route_id, route_goal(turn, route_id), describe_action(*call), tick)
+            plan = update_plan(plan, route_id, route_goal(turn, route_id), describe_action(*call), tick,
+                               route_path(turn, route_id), _my_position(_state(turn)))
             print(f"    LLM executed {describe_action(*call)}{plan_suffix(plan)}")
 
 
@@ -784,6 +1013,70 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def lingering_threads(threads: Any) -> list[Any]:
+    """Alive, non-daemon threads other than the main thread: what blocks interpreter exit."""
+    main = threading.main_thread()
+    return [t for t in threads if t is not main and t.is_alive() and not t.daemon]
+
+
+def describe_threads(threads: Any) -> str:
+    return ", ".join(f"{t.name} (daemon={t.daemon})" for t in threads)
+
+
+def exit_if_threads_linger(code: int, grace_s: float = EXIT_GRACE_S, *, exit_fn=os._exit,
+                           enumerate_fn=threading.enumerate, sleep=time.sleep,
+                           clock=time.monotonic, log=None) -> bool:
+    """Safety net: if non-daemon threads outlive `grace_s`, log them and `exit_fn(code)` (os._exit).
+
+    Python would otherwise wait forever for them at interpreter exit. Returns True when it forced
+    the exit (only observable with a fake `exit_fn`).
+    """
+    log = log or (lambda message: print(message, file=sys.stderr))
+    deadline = clock() + grace_s
+    while True:
+        remaining = lingering_threads(enumerate_fn())
+        if not remaining:
+            return False
+        if clock() >= deadline:
+            break
+        sleep(0.05)
+    log(f"[exit] non-daemon threads still alive after {grace_s:.1f}s grace, forcing exit {code}: "
+        f"{describe_threads(remaining)}; all threads: {describe_threads(enumerate_fn())}")
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:  # noqa: BLE001 - never block the forced exit
+            pass
+    exit_fn(code)
+    return True
+
+
+def run_guarded(fn) -> int:
+    """Run `fn` and turn its outcome into an exit code, printing the traceback on failure."""
+    try:
+        return fn()
+    except SystemExit as exc:
+        return exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+    except BaseException:  # noqa: BLE001 - reported, not swallowed: non-zero exit
+        traceback.print_exc()
+        return 1
+
+
+def with_client(client: Any, body) -> Any:
+    """Start the MCP client, run `body`, and ALWAYS stop it (even if start fails or on Ctrl-C)."""
+    try:
+        client.start()
+        return body()
+    finally:
+        try:
+            client.stop(None, None, None)
+        except Exception as exc:  # noqa: BLE001 - a failing stop must not mask the real error
+            print(f"[exit] MCP client stop failed: {exc}", file=sys.stderr)
+
+
 def main() -> int:
     args = parse_args()
 
@@ -797,15 +1090,18 @@ def main() -> int:
         decider_down_at_start = False
 
     client = MCPClient.load_servers(MCP_SERVERS)[0]
-    with client:
-        if decider_down_at_start:
-            # Point the decider at nothing useful so the first ask fails open immediately.
-            decider.timeout = 1.0
-        stats = play(client, decider, args)
+    if decider_down_at_start:
+        # Point the decider at nothing useful so the first ask fails open immediately.
+        decider.timeout = 1.0
+    stats = with_client(client, lambda: play(client, decider, args))
 
     print(f"\n{stats.summary()}; {decider}")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    exit_code = run_guarded(main)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    exit_if_threads_linger(exit_code)
+    sys.exit(exit_code)
