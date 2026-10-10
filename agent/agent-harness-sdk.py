@@ -28,7 +28,7 @@ MODELS = {
 
 SYSTEM_PROMPT = (
     "You are AmazingPlayer, a Capture the Flag game agent competing as a member of a "
-    "3-player team. You are direct and tactical—make quick strategic decisions to advance "
+    "team. You are direct and tactical—make quick strategic decisions to advance "
     "your team's objectives. Use the MCP connection to interact with the game state, "
     "communicate team positions, coordinate flag captures, and respond to enemy movements "
     "with speed and precision. Analyze game state efficiently and prioritize actions that "

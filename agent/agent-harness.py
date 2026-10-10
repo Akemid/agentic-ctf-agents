@@ -41,9 +41,9 @@ def main() -> None:
 
     agent = create_harness(
         name=args.name,
-        description="A Capture the Flag game agent that plays as a member of a 3-player team, connecting via custom MCP server. Direct and tactical decision-making for fast-paced gameplay.",
+        description="A Capture the Flag game agent that plays as a member of a team, connecting via custom MCP server. Direct and tactical decision-making for fast-paced gameplay.",
         model=model_id,
-        instructions="You are AmazingPlayer, a Capture the Flag game agent competing as a member of a 3-player team. You are direct and tactical—make quick strategic decisions to advance your team's objectives. Use the MCP connection to interact with the game state, communicate team positions, coordinate flag captures, and respond to enemy movements with speed and precision. Analyze game state efficiently and prioritize actions that give your team the best advantage.",
+        instructions="You are AmazingPlayer, a Capture the Flag game agent competing as a member of a team. You are direct and tactical—make quick strategic decisions to advance your team's objectives. Use the MCP connection to interact with the game state, communicate team positions, coordinate flag captures, and respond to enemy movements with speed and precision. Analyze game state efficiently and prioritize actions that give your team the best advantage.",
         effort="low",
         mcp_servers={
             "ctf-game": {

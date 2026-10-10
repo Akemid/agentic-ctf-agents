@@ -15,8 +15,12 @@ illustrative: tune them against real games. STRANDS_DECIDER_URL overrides the en
 from __future__ import annotations
 
 import argparse
+import fcntl
+import http.client
 import json
+import os
 import sys
+import tempfile
 
 from _client import NAME, Decider, ServerUnavailable
 from strands import Agent
@@ -32,7 +36,7 @@ MODELS = {
 
 SYSTEM_PROMPT = (
     "You are AmazingPlayer, a Capture the Flag game agent competing as a member of a "
-    "3-player team. You are direct and tactical—make quick strategic decisions to advance "
+    "team. You are direct and tactical—make quick strategic decisions to advance "
     "your team's objectives. Use the MCP connection to interact with the game state, "
     "communicate team positions, coordinate flag captures, and respond to enemy movements "
     "with speed and precision. Analyze game state efficiently and prioritize actions that "
@@ -86,6 +90,9 @@ MAX_CONSECUTIVE_GUIDES = 2
 MAX_STATE_MESSAGES = 12
 MAX_BLOCK_CHARS = 1500
 
+# Shared by every agent process on this machine to serialize requests to the decider.
+DECIDER_LOCK_FILE = os.path.join(tempfile.gettempdir(), "strands-decider.lock")
+
 
 # --------------------------------------------------------------------------- the gate
 
@@ -132,6 +139,19 @@ class ToolCallReviewer(InterventionHandler):
     def _record(self, tool: str, verdict: str, **scores: float) -> None:
         self.log.append({"tool": tool, **{k: round(v, 2) for k, v in scores.items()}, "verdict": verdict})
 
+    def _ask_serialized(self, state: str) -> dict:
+        """Ask the decider holding a cross-process file lock.
+
+        The server runs inference in a thread pool with no lock, so concurrent requests from
+        the 3 team agents crash it (MPS). One request at a time across all processes.
+        """
+        with open(DECIDER_LOCK_FILE, "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                return self._decider.ask(state, QUESTIONS)
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
     def before_tool_call(self, event, **kwargs):
         tool_name = event.tool_use["name"]
         short = self._short_name(tool_name)
@@ -154,8 +174,10 @@ class ToolCallReviewer(InterventionHandler):
         )
 
         try:
-            answers = self._decider.ask(state, QUESTIONS)
-        except ServerUnavailable as exc:
+            answers = self._ask_serialized(state)
+        except (ServerUnavailable, OSError, http.client.HTTPException) as exc:
+            # RemoteDisconnected is an http.client error, not a URLError, so _client does not
+            # wrap it in ServerUnavailable -- catch the raw connection errors here as well.
             # Fail open: the game must not stop because the reviewer died mid-match.
             self._decider_down = True
             print(f"[intervention] {exc}\n    -> reviewer disabled, proceeding without it\n")
