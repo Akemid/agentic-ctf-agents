@@ -1,0 +1,10 @@
+.venv/
+node_modules/
+__pycache__/
+.env
+.env.local
+.agent/memory/
+.agent/sessions/
+.atl/*
+logs/*
+.DS_Store
