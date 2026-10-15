@@ -269,6 +269,264 @@ drops to a single model call, and fewer LLM timeouts.
 
 ---
 
+## 11. First win: 1–0 (2026-10-10)
+
+**Match.** 200 ticks, deadline 5000 ms, decider warm-up 8.8 s (a cold start, paid before joining).
+
+| Tick | Event |
+|---|---|
+| 16 | red-1 grabs the blue flag |
+| 24 | blue-1 grabs our flag |
+| 32 | **red-1 tags blue-1**, our first successful tag; blue-1 drops our flag and respawns |
+| 35 | **red-1 scores** |
+
+- **Zero deadline misses for us.** The opponent missed 6.
+- The Decider handled every tick: 116 above the threshold, 84 through the budget path. The LLM
+  never fit the 5 s budget, so the `end_turn` hook from entry 10 is still unverified live.
+- **The process exited cleanly** with no `[exit]` line. Always stopping the MCP client in a
+  `finally` block was enough, and the safety net never had to fire.
+
+**New strategic stalemate (ticks 36–199).** After scoring, red-1 spent 164 ticks in 11
+cells around the middle (x 4–8, row 7). The respawned bot holds the middle corridor:
+
+- The direct route (7 steps) is either `BLOCKED (contention)` or carries 2 tag risks.
+- The alternatives are 18–19-step detours that start by walking *backwards*.
+
+Each tick the Decider flips between `direct`, `detour` and `safe` (110 / 41 / 13), so no
+plan survives long enough to pay off. Plan memory shows the plan, but the Decider still
+doesn't commit to an 18-step plan.
+
+**Interpretation.** This is a strategy limit, not a bug, and exactly what the benchmark should
+show. The options a better player has: commit to the long detour, or wait in its own
+field for the bot to cross and tag it. The 2B Decider does neither.
+
+---
+
+## 12. First 1 vs 1: Strands harness vs. decider loop (2026-10-10)
+
+**Setup.**
+
+- One agent per team, no bots, 200 ticks, deadline 6000 ms.
+- Red: `agent-harness.py` (`create_harness`, Haiku).
+- Blue: `agent-decider-loop.py` (the Decider, with Haiku as fallback).
+
+**Result: decider loop 4, harness 0.** The decider loop had four flag captures, each scored
+about 16 ticks later.
+
+| | Harness (red) | Decider loop (blue) |
+|---|---|---|
+| Score | 0 | 4 |
+| Deadline misses | 4 (early ticks) | 0 |
+| Tool calls / decisions | 15 tool calls in total | 201 decisions (161 Decider, 39 LLM) |
+| Latency | — | Decider ~575 ms; LLM median 3.2 s, max 5.1 s |
+
+**The surprising part: the harness stopped reasoning per tick.**
+
+- After missing early deadlines ("los ticks expiran muy rápido"), the harness used its
+  built-in `programmatic_tool_caller` to **write a script** that played the rest of the match.
+- The script blindly followed `enemy_flag_detour` and oscillated between (3,4) and (4,4),
+  then between (2,7) and (2,8), for most of the game. It never captured a flag.
+- The harness's model also described the routes as "recomendadas" ("recommended"), although
+  the prompt and the rules say they are not.
+- So the harness made one strategic decision in the whole match, to hand play over to code,
+  and the code it wrote had no strategy.
+
+**`end_turn` hook validated (entry 10).** LLM ticks now take a median of 3.2 s, versus about
+7.5 s per timed-out call before the hook. All 39 LLM ticks acted, with zero timeouts and zero
+"no action" warnings.
+
+**Benchmark-design decision.** `programmatic_tool_caller` **stays enabled**. It is part of
+what the harness is, and the benchmark measures the harness as shipped. The plain-SDK agent
+(`agent-harness-sdk.py`) does not have it, so a later match covers that case.
+
+**Deeper analysis.**
+
+- **The harness never left its own field.** Its maximum x was 4 (its field ends at x 6), and
+  it spent 154 of 200 ticks on just two cells, (2,7) and (2,8), next to its own flag at (1,7).
+  It defended by accident, never on purpose: it was within 2 cells of the invader in 72
+  ticks, and the invader stood in red's field, so it was taggable. **The harness never
+  tagged.** All 4 of its deadline misses came in ticks 2–5, before the script took over.
+- **The harness's oscillation body-blocked the decider loop.** From tick 88 to about 115,
+  blue-1 stood at (2,6) trying to move down into (2,7), while red's script kept moving into
+  that same cell. The result was `move_blocked (contention)` for 30 of the 48 ticks between
+  scores 2 and 3. The longest gap (48 ticks, versus about 22 for the other cycles) is
+  entirely this jam.
+- **The decider loop's weakness shows up again.** During that jam it chose
+  `enemy_flag_direct` while the route was `BLOCKED (contention)` tick after tick, and took a
+  detour only once in the whole match (134 `enemy_flag_direct`, 61 `own_base_direct`,
+  4 `own_base_detour`, 1 `enemy_flag_detour`). Plan memory labels the blocked route as
+  "continues your current path", which reinforces the insistence (the risk flagged in
+  entry 6). It still won because the opponent was harmless, not because it handled the block.
+- **The Haiku fallback** acted in all 39 of its ticks, always with `move`; it never chose
+  `tag`, `wait` or `grab_flag`.
+
+**What the match does and does not prove.**
+
+- It proves that, at a 6 s deadline, an architecture that decides every tick in under a
+  second beats a harness that answers latency by delegating to a one-shot script.
+- It does not prove the Decider's strategy is good. Its opponent never left home and never
+  tagged, so the Decider's known weaknesses (ignoring threats, insisting on blocked
+  routes) were never punished.
+
+---
+
+## 13. Plain SDK agent vs. decider loop (2026-10-10, stopped at tick ~107)
+
+**Setup.**
+
+- One agent per team, deadline 6000 ms.
+- Red: `agent-harness-sdk.py` (a plain Strands `Agent`, Haiku, no `programmatic_tool_caller`).
+- Blue: the decider loop.
+- The user stopped the server by force after ~100 ticks. Score: 0–0.
+
+**The SDK agent was effectively frozen.**
+
+- It had **100 `action_rejected reason=deadline` events in about 108 ticks** and sat on
+  (4,8) for 101 ticks.
+- It reasons in a single growing conversation (`wait_for_turn` → think → act, all in one
+  `Agent` call), so every tick costs a full model turn over an ever-longer history. At a
+  6 s deadline it almost never acts in time.
+- Its own log is nearly empty: it was launched without `PYTHONUNBUFFERED=1` through
+  `uv run … | tee`, so the buffered stdout was lost when it was killed. Next time, launch it
+  unbuffered.
+
+**The decider loop captured the flag at tick 16, then circled for 90 ticks without scoring.**
+
+- Carrying the flag, it repeated a perfect 4-tick loop, (3,9) → (2,9) → (2,8) → (3,8) →
+  (3,9), from about tick 20 until the stop.
+- Every tick offered three routes home:
+  - `own_base_direct`: 11–13 steps, 1–2 tag risks next to the frozen red-1 at (4,8).
+  - `own_base_detour`: 13–15 steps, 1–2 tag risks.
+  - `own_base_safe`: 13–15 steps, **zero risks**.
+- The Decider alternated between `direct` (42) and `detour` (50) and **never chose
+  `own_base_safe`**. Because each choice starts a new path, no plan ever continued. At most 2
+  extra steps of safety would have scored.
+- The "risk" was a frozen opponent that never acted, but the Decider could not know that;
+  it read the risks and still picked a risky route.
+
+**Fallback under load.** There were 60 LLM timeouts and only 6 completed LLM ticks (median
+3.3 s), against 0 timeouts and a 3.2 s median in entry 12. The likely cause, not verified, is
+Bedrock throttling: both agents were calling Haiku at the same time, and the SDK agent was
+sending long prompts.
+
+**Robustness check passed.** When the server was stopped, the decider loop logged 5
+`session not found` errors and exited with `wait_for_turn kept failing`, instead of the
+~14,500 retries from the earlier bug.
+
+**What it shows.**
+
+1. An LLM that reasons inside one long conversation cannot keep up with a 6 s tick; the
+   architecture loses before strategy matters.
+2. The Decider's weakness this time was not ignoring threats but **failing to trade length
+   for safety**. A risk-free route, 2 steps longer, existed every tick.
+
+---
+
+## 14. Strands decider agent vs. decider loop (2026-10-10)
+
+**Setup.**
+
+- One agent per team, 50 ticks, deadline 5000 ms.
+- Red: `agent-strand-decider.py`, a plain SDK `Agent` (Haiku) with a `before_tool_call`
+  intervention. The Decider checks `args_grounded` / `stale_state` and `Guide`s bad calls.
+- Blue: the decider loop.
+- Both share **one Decider server and one cross-process lock**, an equal handicap for both.
+
+**Result: decider loop 1, strands decider agent 0.**
+
+- Blue grabbed at tick 14, scored at tick 26 and grabbed again at tick 40.
+
+**The strands decider agent never moved.**
+
+- It had **49 `action_rejected reason=deadline` in 50 ticks** and stayed on (0,7) the whole
+  match.
+- Its intervention reviewed 26 actions and proceeded with all of them (it guided 0 of 26).
+  The gate was not the problem: by the time a reviewed action reached the server, the tick
+  was gone.
+- Each tick it pays for an LLM turn over a growing conversation, plus a Decider review that
+  waits on the shared lock.
+- At tick 14, blue grabbed red's flag from (1,7), right next to red-1 at (0,7). Red stood in
+  its own field and could have tagged, but it was always one tick late.
+
+**The agent's self-report was fiction.** Its final summary says "I tried to chase and tag
+Blue-1 several times… Blue kept dodging my blocks." The game state shows red-1 never left
+(0,7). The only true sentence is the one blaming deadlines and `stale_tick`.
+**Lesson: never evaluate an agent by its own narrative; use the server's events.**
+
+**Shared Decider cost.**
+
+- Our wall time per Decider call had a median of 1450 ms, while the server-side latency
+  median was 605 ms, so about 850 ms per tick went to waiting on the other agent's
+  Decider calls.
+- The warm-up took 22 s: a cold start plus waiting in the queue.
+- With a 5 s deadline we still never missed a tick.
+
+---
+
+## Benchmark summary so far
+
+| Match | Deadline | Winner | Loser's deadline misses | Why the loser lost |
+|---|---|---|---|---|
+| vs. bot (entry 11) | 5 s | decider loop 1–0 | — | stalemate after scoring; bot guarded the middle |
+| vs. Strands harness (12) | 6 s | decider loop 4–0 | 4 | delegated play to a one-shot script that oscillated at home |
+| vs. plain SDK agent (13) | 6 s | 0–0 (stopped at ~107) | 100 / ~108 | one growing conversation, too slow for the tick |
+| vs. Strands decider agent (14) | 5 s | decider loop 1–0 | 49 / 50 | slow LLM turn plus a review gate on every action |
+
+**Thesis supported by the data.** At sub-10 s ticks, **who owns the loop matters more than
+how smart the model is.**
+
+- If the agent owns the loop, every tick costs at least one full LLM turn, and the Decider
+  can only add a check (entry 1). That never beat the clock here.
+- If our code owns the loop, the Decider decides in under a second and the LLM is an
+  optional fallback, bounded by a timeout.
+
+**What is still unproven.** Whether a *fast-enough* LLM agent would out-strategise the
+Decider. The Decider's known weaknesses (ignoring threats, insisting on blocked routes,
+never trading length for safety) have not yet been punished by a competitor that acts in
+time.
+
+---
+
+## 15. Refined agents: `agent/refined/` (2026-10-10)
+
+**Decision.** Put the improvements in new files under `agent/refined/` and leave the
+originals untouched, so every future match can compare the before and after directly.
+
+**Changes, and the problem each one targets.**
+
+| File | Change | Targets |
+|---|---|---|
+| `decider_loop.py` | **One Decider request, three questions:** `threat` (noul), `route_bad` (noul), `action` (choice). A pure policy, `combine_answers`, picks a tag or `defend_flag` on a threat, and a risk-free same-goal route when the chosen one is bad. | Ignored threats, insistence on blocked routes, never choosing `*_safe` (entries 5, 12, 13) |
+| `decider_loop.py` | A blocked route is no longer labelled "continues your current path". It now reads "would continue your path but is BLOCKED now". | The plan memory reinforcing a blocked route (entry 12) |
+| `harness_sdk.py`, `strand_decider.py` | **Bounded history:** `SlidingWindowConversationManager(window_size=12, per_turn=True, pin_first=1)`, about 3 ticks of tool calls with the instruction pinned. | Per-tick cost growing with the conversation (100/108 and 49/50 deadline misses) |
+| same | **`StripStaticWallsHook`:** an `AfterToolCallEvent` hook that drops the static `walls` list from `wait_for_turn` results after the first turn. | Large tool results every tick |
+| all LLM agents | **Act-fast prompt:** "call wait_for_turn, then immediately exactly one action; no text between tool calls; don't call get_rules again". | Long narration between tool calls |
+| `strand_decider.py` | Decider review only for `tag` and `grab_flag`; `move` and `wait` proceed immediately. | One Decider round trip, plus a wait on the shared lock, on every move |
+
+**Why the three-question design is cheap.** The client notes that the state is encoded once
+and shared across all questions in a request. Two extra `noul` questions add almost no
+latency, and they replace one broad choice with narrow, focused questions, which is what a
+small classifier is good at.
+
+**Fairness check.** None of these changes tells an LLM agent *which strategy* to use.
+
+- The prompt change is about speed only, and the routes paragraph stays neutral.
+- The Decider policy combines the Decider's own answers. The thresholds are explicit CLI
+  flags (`--threat-threshold`).
+
+**SDK facts verified (strands 1.59.0).**
+
+- `window_size` counts messages, not tokens.
+- `per_turn=True` is required, because by default trimming runs only at the end of an agent
+  call, and a whole match is a single call.
+- `AfterToolCallEvent.result` is writable, and the executor uses the rewritten value.
+- `create_harness` has its own `context_manager`, which takes precedence over a
+  conversation manager, so the refined harness only gets the prompt change.
+
+**Status.** 200 tests pass (37 new). Not yet validated in a live match.
+
+---
+
 ## Bugs worth a paragraph
 
 - **Silent retry storm.** When the server stopped, strands returned transport errors as
