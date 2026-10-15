@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.mypy_cache/
+.pytest_cache/
+spikes/s4-work/
+spikes/**/answers-*.json
+
+# Local agent tooling (personal environment, not project config)
+.atl/
