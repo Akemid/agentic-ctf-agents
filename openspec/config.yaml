@@ -1,0 +1,37 @@
+schema: spec-driven
+context: |
+  Project: ctfagents (Amazon Bedrock AgentCore CLI project, managedBy CDK).
+  Stack: Python 3.13 local / PYTHON_3_14 runtime (uv, hatchling, strands-agents, bedrock-agentcore, mcp) in app/harness_sdk;
+  TypeScript CDK (@aws/agentcore-cdk L3, aws-cdk-lib ~2.261, jest + ts-jest) in agentcore/cdk.
+  agentcore/agentcore.json is the source of truth; do not hand-edit generated CDK behavior.
+  Planned: port sibling ../amazingplayer-python (CTF game agents, Python, uv, strands-decider) into app/.
+  Persistence: hybrid (engram + openspec).
+strict_tdd: true
+testing:
+  strict_tdd: true
+  runners:
+    cdk:
+      command: "cd agentcore/cdk && npx jest"
+      framework: "jest 29 + ts-jest"
+      status: working (1 suite, 1 test passing)
+    python:
+      command: "cd app/harness_sdk && uv run --with pytest pytest"
+      framework: "pytest (not yet a declared dependency; no tests exist)"
+      status: requires adding pytest as a dev dependency
+  layers:
+    unit: {available: true, tool: "jest (CDK); pytest after setup (Python)"}
+    integration: {available: false, tool: null}
+    e2e: {available: false, tool: null}
+  coverage: {available: false, command: "npx jest --coverage (CDK, built into jest)"}
+  quality:
+    linter: {available: false, command: null}
+    type_checker: {available: true, command: "cd agentcore/cdk && npx tsc --noEmit"}
+    formatter: {available: true, command: "cd agentcore/cdk && npm run format:check (prettier)"}
+rules:
+  proposal: {require_rollback_plan: true}
+  specs: {format: "Given/When/Then"}
+  design: {note: "Respect agentcore.json schema-first invariants; renaming resources recreates them"}
+  tasks: {review_budget_lines: 400}
+  apply: {tdd: strict}
+  verify: {run_tests: true}
+  archive: {}

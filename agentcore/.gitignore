@@ -11,5 +11,5 @@ cdk/node_modules/
 # Ephemeral Staging
 .cache/*
 
-# Exception: Commit the State
-!.cli/deployed-state.json
+# Deployed state is NOT committed: this is a public repo and the file holds
+# account-specific ARNs. `agentcore deploy` rebuilds it from stack outputs.
