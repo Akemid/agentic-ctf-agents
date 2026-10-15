@@ -1,9 +1,16 @@
 """Pure decision logic of the `decider_loop` runtime (no I/O, no MCP, no Strands).
 
-Ported verbatim from `local/agent/refined/decider_loop.py` and characterization-tested against it
-(`tests/test_loop_logic.py`). Only three things differ: the question builders come from
-`ctf_common.decider`, the fcntl lock and CLI are gone, and the fallback system prompt is named
+Ported from `local/agent/refined/decider_loop.py` and characterization-tested against it
+(`tests/test_loop_logic.py`), kept in lockstep with it. Only three things differ: the question builders come
+from `ctf_common.decider`, the fcntl lock and CLI are gone, and the fallback system prompt is named
 `LLM_SYSTEM_PROMPT` so it cannot be confused with `ctf_common.prompts.SYSTEM_PROMPT`.
+
+MCP turn contract v2: the turn `state` no longer carries the static board (`grid`, `walls`, `fields`,
+`flags[].base`). The loop captures it once (`join_match.map`, else `get_map`) as a `MapInfo` and passes it
+to the functions that need it (`render_state`, `build_options`). Routes carry `closest_threat` instead of
+`min_enemy_distance`, and turns carry the server's own `last_action`. The loop keeps its own
+`Plan.last_action` (an executed-action note used for plan continuity); the server's is only rendered, for the
+LLM fallback only (never for the decider), and never used to decide.
 
 The decider classifies, the code decides: `combine_answers` merges three answers (threat,
 route_bad, action) into one option label, `choose_path` decides between decider, LLM fallback and
@@ -29,6 +36,7 @@ LLM_SYSTEM_PROMPT = (
 
 # Raw tool names (VERIFIED via list_tools_sync). No server-name prefix on direct calls.
 TOOL_JOIN = "join_match"
+TOOL_GET_MAP = "get_map"
 TOOL_WAIT_FOR_TURN = "wait_for_turn"
 ACTION_TOOLS = ("move", "tag", "grab_flag", "wait")
 
@@ -146,12 +154,59 @@ def _enemies(state: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def _in_my_field(state: dict[str, Any]) -> bool:
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+@dataclass(frozen=True)
+class MapInfo:
+    """The static board, captured once from `join_match.map` (or `get_map`). It never changes in a match.
+
+    `fields` maps a team to its `(min_x, max_x)` columns, `neutral_x` is the neutral column, `flag_bases`
+    maps a team to its base cell. `walls` is kept for completeness: movement and routes are server-computed.
+    """
+
+    fields: dict[str, tuple[int, int]]
+    neutral_x: int | None
+    walls: frozenset[tuple[int, int]]
+    flag_bases: dict[str, tuple[int, int]]
+
+
+def parse_map(raw: Any) -> MapInfo | None:
+    """A `MapInfo` from a `join_match.map` / `get_map` payload; None when it has no usable `fields` (pure)."""
+    raw_fields = raw.get("fields") if isinstance(raw, dict) else None
+    if not isinstance(raw_fields, dict):
+        return None
+    fields: dict[str, tuple[int, int]] = {}
+    for team in ("red", "blue"):
+        bounds = raw_fields.get(team)
+        if isinstance(bounds, dict) and _is_int(bounds.get("min_x")) and _is_int(bounds.get("max_x")):
+            fields[team] = (bounds["min_x"], bounds["max_x"])
+    if not fields:
+        return None
+    walls = raw.get("walls")
+    bases = raw.get("flag_bases")
+    return MapInfo(
+        fields=fields,
+        neutral_x=raw_fields["neutral_x"] if _is_int(raw_fields.get("neutral_x")) else None,
+        walls=frozenset(c for c in map(_xy, walls if isinstance(walls, list) else []) if c is not None),
+        flag_bases={
+            team: cell
+            for team, cell in (
+                (t, _xy(bases.get(t) if isinstance(bases, dict) else None)) for t in ("red", "blue")
+            )
+            if cell is not None
+        },
+    )
+
+
+def _in_my_field(state: dict[str, Any], map_info: MapInfo | None = None) -> bool:
+    """Whether we stand in our own field. False without the map: the turn state no longer says."""
     me = _my_position(state)
-    field = (state.get("fields") or {}).get(_my_team(state) or "")
-    if me is None or not isinstance(field, dict):
+    bounds = map_info.fields.get(_my_team(state) or "") if map_info is not None else None
+    if me is None or bounds is None:
         return False
-    return field.get("min_x", 1) <= me[0] <= field.get("max_x", 0)
+    return bounds[0] <= me[0] <= bounds[1]
 
 
 def _is_adjacent(a: tuple[int, int], b: tuple[int, int]) -> bool:
@@ -380,19 +435,26 @@ def describe_route(route: dict[str, Any]) -> str:
             f"can be tagged by {r.get('enemy_id', '?')} at step {r.get('step', '?')}" for r in risks
         )
         parts.append(f"{_plural(len(risks), 'risk')}: {detail}")
-    distance = route.get("min_enemy_distance")
-    if isinstance(distance, int) and not isinstance(distance, bool):
-        parts.append(f"nearest enemy {distance}")
+    if "closest_threat" in route:
+        threat = route["closest_threat"]
+        if isinstance(threat, dict):
+            parts.append(
+                f"closest threat {threat.get('enemy_id', '?')} at step {threat.get('step', '?')}, "
+                f"distance {threat.get('distance', '?')}"
+            )
     return ", ".join(parts)
 
 
-def build_options(turn: dict[str, Any], plan: Plan | None = None) -> dict[str, str]:
+def build_options(
+    turn: dict[str, Any], plan: Plan | None = None, map_info: MapInfo | None = None
+) -> dict[str, str]:
     """Options for the decider `choice` question, built from the state. Always includes `wait`.
 
     One option per server route (label = route id). Without routes, falls back to one
     `move_<dir>` option per open direction (and adjacent tags). No option is ever recommended.
     With a `plan`, every route whose path continues the plan's path gets a neutral note, and
-    other routes with the same goal are marked as a different path.
+    other routes with the same goal are marked as a different path. The adjacent-`tag_` fallback needs
+    `map_info` (to know we stand in our own field); without it no tag option is invented.
     """
     state = _state(turn)
     me, team = _my_position(state), _my_team(state)
@@ -423,7 +485,7 @@ def build_options(turn: dict[str, Any], plan: Plan | None = None) -> dict[str, s
     ):
         options["grab_flag"] = "pick up the enemy flag you are standing on"
 
-    if not routes and me is not None and _in_my_field(state):
+    if not routes and me is not None and _in_my_field(state, map_info):
         for enemy in _enemies(state):
             pos = _xy(enemy.get("position"))
             if pos is not None and _is_adjacent(me, pos):
@@ -704,7 +766,7 @@ def run_with_timeout(fn, timeout_s: float) -> tuple[bool, Any]:
 def warmup_question() -> tuple[str, dict[str, dict[str, Any]]]:
     """A representative (state, questions) pair for the decider warm-up (pure, no server)."""
 
-    def route(rid, goal, step, length, risks=(), blocked=False, dist=3):
+    def route(rid, goal, step, length, risks=(), blocked=False, threat=None):
         return {
             "id": rid,
             "goal": goal,
@@ -714,7 +776,9 @@ def warmup_question() -> tuple[str, dict[str, dict[str, Any]]]:
             "blocked_now": blocked,
             "blocked_reason": "contention" if blocked else None,
             "risks": [{"step": st, "enemy_id": en} for st, en in risks],
-            "min_enemy_distance": dist,
+            "closest_threat": (
+                None if threat is None else {"enemy_id": threat[0], "step": threat[1], "distance": threat[2]}
+            ),
         }
 
     def agent(aid, team, x, y):
@@ -739,30 +803,32 @@ def warmup_question() -> tuple[str, dict[str, dict[str, Any]]]:
                 agent("red-3", "red", 2, 7),
             ],
             "flags": [
-                {"team": "red", "base": {"x": 1, "y": 7}, "position": {"x": 1, "y": 7}, "carried_by": None},
-                {
-                    "team": "blue",
-                    "base": {"x": 13, "y": 7},
-                    "position": {"x": 13, "y": 7},
-                    "carried_by": None,
-                },
+                {"team": "red", "position": {"x": 1, "y": 7}, "carried_by": None},
+                {"team": "blue", "position": {"x": 13, "y": 7}, "carried_by": None},
             ],
             "score": {"red": 1, "blue": 0},
-            "fields": {"red": {"min_x": 0, "max_x": 6}, "blue": {"min_x": 8, "max_x": 14}, "neutral_x": 7},
             "self": "blue-1",
             "self_position": {"x": 9, "y": 7},
             "teammates": [{"id": "blue-2", "position": {"x": 11, "y": 4}}],
             "routes": [
-                route("enemy_flag_direct", "enemy_flag", "left", 8, [(3, "red-1")], dist=2),
-                route("enemy_flag_detour", "enemy_flag", "up", 11, dist=4),
-                route("tag:red-1", "tag", "left", 4, dist=4),
+                route("enemy_flag_direct", "enemy_flag", "left", 8, [(3, "red-1")], threat=("red-1", 6, 2)),
+                route("enemy_flag_detour", "enemy_flag", "up", 11, threat=("red-2", 4, 4)),
+                route("tag:red-1", "tag", "left", 4),
                 route("home_base", "own_base", "right", 4, blocked=True),
             ],
         },
         "events": [{"type": "moved", "agent_id": "red-1", "from": {"x": 6, "y": 6}, "to": {"x": 5, "y": 6}}],
+        "last_action": {"action": "move:left", "tick": 11, "result": "moved"},
     }
     plan = Plan("enemy_flag_direct", "enemy_flag", 9, "move left")
-    return render_state(turn, plan), build_questions(build_options(turn, plan))
+    map_info = parse_map(
+        {
+            "fields": {"red": {"min_x": 0, "max_x": 6}, "blue": {"min_x": 8, "max_x": 14}, "neutral_x": 7},
+            "walls": [],
+            "flag_bases": {"red": {"x": 1, "y": 7}, "blue": {"x": 13, "y": 7}},
+        }
+    )
+    return render_state(turn, plan, map_info), build_questions(build_options(turn, plan, map_info))
 
 
 def accept_choice(label: str | None, confidence: float, threshold: float) -> bool:
@@ -821,21 +887,49 @@ def _plan_line(turn: dict[str, Any], plan: Plan) -> str:
     return f"{line}; last action: {plan.last_action}" if plan.last_action else line
 
 
-def render_state(turn: dict[str, Any], plan: Plan | None = None) -> str:
-    """Short, human-readable summary of a wait_for_turn result for the decider and the LLM fallback."""
+def describe_last_action(last_action: Any) -> str | None:
+    """The server's `last_action` ({action, tick, result, reason?}) as one line, None when absent."""
+    if not isinstance(last_action, dict) or not isinstance(last_action.get("action"), str):
+        return None
+    result = str(last_action.get("result", "unknown"))
+    reason = last_action.get("reason")
+    outcome = f"{result} ({reason})" if reason else result
+    tick = last_action.get("tick", "?")
+    return f"outcome of your previous action: {last_action['action']} at tick {tick} -> {outcome}"
+
+
+def render_state(
+    turn: dict[str, Any],
+    plan: Plan | None = None,
+    map_info: MapInfo | None = None,
+    include_last_action: bool = False,
+) -> str:
+    """Short, human-readable summary of a wait_for_turn result for the decider and the LLM fallback.
+
+    Where we stand relative to the fields needs `map_info` (the turn no longer carries `fields`); without it
+    the position is shown plainly rather than guessed.
+
+    The server's `last_action` is rendered only with `include_last_action` (the LLM fallback): the decider is
+    a trained model and its input text must not change until that wording has been evaluated.
+    """
     state = _state(turn)
     me = _my_position(state)
     lines = [f"tick: {extract_tick(turn)}"]
 
     if me is not None:
-        if _in_my_field(state):
-            where = "in your own field"
-        elif me[0] == (state.get("fields") or {}).get("neutral_x"):
-            where = "on the neutral line"
-        else:
-            where = "in the enemy field"
-        lines.append(f"you: {state.get('self')} ({_my_team(state)}) at {me}, {where}")
+        where = ""
+        if map_info is not None:
+            if _in_my_field(state, map_info):
+                where = ", in your own field"
+            elif me[0] == map_info.neutral_x:
+                where = ", on the neutral line"
+            else:
+                where = ", in the enemy field"
+        lines.append(f"you: {state.get('self')} ({_my_team(state)}) at {me}{where}")
     lines.append(f"carrying the flag: {'yes' if _carrying(state) else 'no'}")
+    last_action = describe_last_action(turn.get("last_action")) if include_last_action else None
+    if last_action:
+        lines.append(last_action)
     if _plan_active(plan):
         lines.append(_plan_line(turn, plan))
 
@@ -867,6 +961,27 @@ def render_state(turn: dict[str, Any], plan: Plan | None = None) -> str:
     if events:
         lines.append("recent events: " + "; ".join(events))
     return "\n".join(lines)
+
+
+def describe_match_over(turn: dict[str, Any]) -> str:
+    """One log line for a `match_over` result. `winner` is null when the match was stopped early."""
+    reason = turn.get("reason") if isinstance(turn.get("reason"), str) else "unknown"
+    winner = turn.get("winner")
+    verdict = f"winner {winner}" if isinstance(winner, str) and winner else "no winner"
+    score = turn.get("score")
+    tail = ", score " + ", ".join(f"{k} {v}" for k, v in score.items()) if isinstance(score, dict) else ""
+    return f"match over ({reason}): {verdict}{tail}"
+
+
+def action_rejection(outcome: dict[str, Any]) -> str | None:
+    """The reason of a rejected action ack (`status: rejected`), `unknown` if it has none; None otherwise.
+
+    Rejections are normal results, not MCP errors. New in v2: `match_over`, `match_not_started`, `not_joined`.
+    """
+    if outcome.get("status") != "rejected":
+        return None
+    reason = outcome.get("reason")
+    return reason if isinstance(reason, str) and reason else "unknown"
 
 
 class Stats:

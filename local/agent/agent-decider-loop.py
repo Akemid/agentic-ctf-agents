@@ -16,18 +16,21 @@ STRANDS_DECIDER_URL overrides the decider endpoint.
 Verified against the live servers (see comments marked VERIFIED / ASSUMPTION):
 
 - VERIFIED  MCP tool names (raw, no prefix, because we call the MCPClient directly):
-            get_rules, join_match, wait_for_turn, move, tag, grab_flag, wait.
+            get_rules, get_map, join_match, wait_for_turn, move, tag, grab_flag, wait.
 - VERIFIED  A decider `choice` answer is
             {"type": "choice", "choice": <label>, "probabilities": {...}, "confidence": <float>}.
             Note `confidence` is NOT the top probability (0.31 next to 0.48 was observed), so the
             threshold applies to `confidence`.
-- VERIFIED  `wait_for_turn` payload (from a real match): top-level `status`, `tick`, `events`, and
-            the game state under `state` (grid, walls, agents, flags, score, fields, self,
-            self_position, moves, teammates). `state.agents[].carrying` is non-null while an agent
-            holds a flag; we only treat it as a boolean.
+- VERIFIED  `wait_for_turn` payload (MCP turn contract v2): top-level `status`, `tick`, `events`,
+            `last_action` (the outcome of our previous action, null on the first turn) and the game
+            state under `state` (agents, flags, score, self, self_position, moves, teammates, routes).
+            `state` NO LONGER carries `grid`, `walls`, `fields` or `flags[].base`: the static map
+            comes once from `join_match.map` (or `get_map`) and is kept as a `MapInfo`.
+            `state.agents[].carrying` is non-null while an agent holds a flag; we only treat it as a
+            boolean.
 - VERIFIED  `state.routes` (from get_rules): advisory route options computed by the server, each
             with id, goal, first_step, length, path, blocked_now, blocked_reason, risks and
-            min_enemy_distance. The server never recommends a route and neither does this client:
+            closest_threat ({enemy_id, step, distance} or null). The server never recommends a route and neither does this client:
             the decider (or the LLM fallback) chooses between them. When `routes` is empty or
             missing, the agent falls back to plain per-direction `move_<dir>` options.
 - ASSUMPTION `turn["observation"]` is only a fallback when `state` is missing.
@@ -83,6 +86,7 @@ MCP_SERVERS = {
 
 # Raw tool names (VERIFIED via list_tools_sync). No server-name prefix on direct calls.
 TOOL_JOIN = "join_match"
+TOOL_GET_MAP = "get_map"
 TOOL_WAIT_FOR_TURN = "wait_for_turn"
 ACTION_TOOLS = ("move", "tag", "grab_flag", "wait")
 
@@ -188,12 +192,59 @@ def _enemies(state: dict[str, Any]) -> list[dict[str, Any]]:
         and not a.get("disconnected") and a.get("id") != state.get("self")
     ]
 
-def _in_my_field(state: dict[str, Any]) -> bool:
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+@dataclass(frozen=True)
+class MapInfo:
+    """The static board, captured once from `join_match.map` (or `get_map`). It never changes in a match.
+
+    `fields` maps a team to its `(min_x, max_x)` columns, `neutral_x` is the neutral column, `flag_bases`
+    maps a team to its base cell. `walls` is kept for completeness: movement and routes are server-computed.
+    """
+
+    fields: dict[str, tuple[int, int]]
+    neutral_x: int | None
+    walls: frozenset[tuple[int, int]]
+    flag_bases: dict[str, tuple[int, int]]
+
+
+def parse_map(raw: Any) -> MapInfo | None:
+    """A `MapInfo` from a `join_match.map` / `get_map` payload; None when it has no usable `fields` (pure)."""
+    raw_fields = raw.get("fields") if isinstance(raw, dict) else None
+    if not isinstance(raw_fields, dict):
+        return None
+    fields: dict[str, tuple[int, int]] = {}
+    for team in ("red", "blue"):
+        bounds = raw_fields.get(team)
+        if isinstance(bounds, dict) and _is_int(bounds.get("min_x")) and _is_int(bounds.get("max_x")):
+            fields[team] = (bounds["min_x"], bounds["max_x"])
+    if not fields:
+        return None
+    walls = raw.get("walls")
+    bases = raw.get("flag_bases")
+    return MapInfo(
+        fields=fields,
+        neutral_x=raw_fields["neutral_x"] if _is_int(raw_fields.get("neutral_x")) else None,
+        walls=frozenset(c for c in map(_xy, walls if isinstance(walls, list) else []) if c is not None),
+        flag_bases={
+            team: cell
+            for team, cell in (
+                (t, _xy(bases.get(t) if isinstance(bases, dict) else None)) for t in ("red", "blue")
+            )
+            if cell is not None
+        },
+    )
+
+
+def _in_my_field(state: dict[str, Any], map_info: MapInfo | None = None) -> bool:
+    """Whether we stand in our own field. False without the map: the turn state no longer says."""
     me = _my_position(state)
-    field = (state.get("fields") or {}).get(_my_team(state) or "")
-    if me is None or not isinstance(field, dict):
+    bounds = map_info.fields.get(_my_team(state) or "") if map_info is not None else None
+    if me is None or bounds is None:
         return False
-    return field.get("min_x", 1) <= me[0] <= field.get("max_x", 0)
+    return bounds[0] <= me[0] <= bounds[1]
 
 def _is_adjacent(a: tuple[int, int], b: tuple[int, int]) -> bool:
     return abs(a[0] - b[0]) + abs(a[1] - b[1]) == 1
@@ -396,19 +447,23 @@ def describe_route(route: dict[str, Any]) -> str:
     if risks:
         detail = "; ".join(f"can be tagged by {r.get('enemy_id', '?')} at step {r.get('step', '?')}" for r in risks)
         parts.append(f"{_plural(len(risks), 'risk')}: {detail}")
-    distance = route.get("min_enemy_distance")
-    if isinstance(distance, int) and not isinstance(distance, bool):
-        parts.append(f"nearest enemy {distance}")
+    if "closest_threat" in route:
+        threat = route["closest_threat"]
+        if isinstance(threat, dict):
+            parts.append(f"closest threat {threat.get('enemy_id', '?')} at step {threat.get('step', '?')}, "
+                         f"distance {threat.get('distance', '?')}")
     return ", ".join(parts)
 
 
-def build_options(turn: dict[str, Any], plan: Plan | None = None) -> dict[str, str]:
+def build_options(turn: dict[str, Any], plan: Plan | None = None,
+                  map_info: MapInfo | None = None) -> dict[str, str]:
     """Options for the decider `choice` question, built from the state. Always includes `wait`.
 
     One option per server route (label = route id). Without routes, falls back to one
     `move_<dir>` option per open direction (and adjacent tags). No option is ever recommended.
     With a `plan`, every route whose path continues the plan's path gets a neutral note, and
-    other routes with the same goal are marked as a different path.
+    other routes with the same goal are marked as a different path. The adjacent-`tag_` fallback needs
+    `map_info` (to know we stand in our own field); without it no tag option is invented.
     """
     state = _state(turn)
     me, team = _my_position(state), _my_team(state)
@@ -432,7 +487,7 @@ def build_options(turn: dict[str, Any], plan: Plan | None = None) -> dict[str, s
             and _xy(enemy_flag.get("position")) == me):
         options["grab_flag"] = "pick up the enemy flag you are standing on"
 
-    if not routes and me is not None and _in_my_field(state):
+    if not routes and me is not None and _in_my_field(state, map_info):
         for enemy in _enemies(state):
             pos = _xy(enemy.get("position"))
             if pos is not None and _is_adjacent(me, pos):
@@ -631,10 +686,12 @@ def run_with_timeout(fn, timeout_s: float) -> tuple[bool, Any]:
 
 def warmup_question() -> tuple[str, dict[str, dict[str, Any]]]:
     """A representative (state, questions) pair for the decider warm-up (pure, no server)."""
-    def route(rid, goal, step, length, risks=(), blocked=False, dist=3):
+    def route(rid, goal, step, length, risks=(), blocked=False, threat=None):
         return {"id": rid, "goal": goal, "first_step": step, "length": length, "path": [],
                 "blocked_now": blocked, "blocked_reason": "contention" if blocked else None,
-                "risks": [{"step": st, "enemy_id": en} for st, en in risks], "min_enemy_distance": dist}
+                "risks": [{"step": st, "enemy_id": en} for st, en in risks],
+                "closest_threat": (None if threat is None
+                                   else {"enemy_id": threat[0], "step": threat[1], "distance": threat[2]})}
 
     def agent(aid, team, x, y):
         return {"id": aid, "team": team, "position": {"x": x, "y": y}, "carrying": None, "disconnected": False}
@@ -645,21 +702,25 @@ def warmup_question() -> tuple[str, dict[str, dict[str, Any]]]:
             "tick": 12,
             "agents": [agent("blue-1", "blue", 9, 7), agent("blue-2", "blue", 11, 4),
                        agent("red-1", "red", 5, 6), agent("red-2", "red", 4, 9), agent("red-3", "red", 2, 7)],
-            "flags": [{"team": "red", "base": {"x": 1, "y": 7}, "position": {"x": 1, "y": 7}, "carried_by": None},
-                      {"team": "blue", "base": {"x": 13, "y": 7}, "position": {"x": 13, "y": 7}, "carried_by": None}],
+            "flags": [{"team": "red", "position": {"x": 1, "y": 7}, "carried_by": None},
+                      {"team": "blue", "position": {"x": 13, "y": 7}, "carried_by": None}],
             "score": {"red": 1, "blue": 0},
-            "fields": {"red": {"min_x": 0, "max_x": 6}, "blue": {"min_x": 8, "max_x": 14}, "neutral_x": 7},
             "self": "blue-1", "self_position": {"x": 9, "y": 7},
             "teammates": [{"id": "blue-2", "position": {"x": 11, "y": 4}}],
-            "routes": [route("enemy_flag_direct", "enemy_flag", "left", 8, [(3, "red-1")], dist=2),
-                       route("enemy_flag_detour", "enemy_flag", "up", 11, dist=4),
-                       route("tag:red-1", "tag", "left", 4, dist=4),
+            "routes": [route("enemy_flag_direct", "enemy_flag", "left", 8, [(3, "red-1")], threat=("red-1", 6, 2)),
+                       route("enemy_flag_detour", "enemy_flag", "up", 11, threat=("red-2", 4, 4)),
+                       route("tag:red-1", "tag", "left", 4),
                        route("home_base", "own_base", "right", 4, blocked=True)],
         },
         "events": [{"type": "moved", "agent_id": "red-1", "from": {"x": 6, "y": 6}, "to": {"x": 5, "y": 6}}],
+        "last_action": {"action": "move:left", "tick": 11, "result": "moved"},
     }
     plan = Plan("enemy_flag_direct", "enemy_flag", 9, "move left")
-    return render_state(turn, plan), {"action": Decider.choice(DECIDER_INSTRUCTIONS, build_options(turn, plan))}
+    map_info = parse_map({"fields": {"red": {"min_x": 0, "max_x": 6}, "blue": {"min_x": 8, "max_x": 14},
+                                     "neutral_x": 7},
+                          "walls": [], "flag_bases": {"red": {"x": 1, "y": 7}, "blue": {"x": 13, "y": 7}}})
+    return render_state(turn, plan, map_info), {
+        "action": Decider.choice(DECIDER_INSTRUCTIONS, build_options(turn, plan, map_info))}
 
 
 def accept_choice(label: str | None, confidence: float, threshold: float) -> bool:
@@ -717,21 +778,48 @@ def _plan_line(turn: dict[str, Any], plan: Plan) -> str:
     return f"{line}; last action: {plan.last_action}" if plan.last_action else line
 
 
-def render_state(turn: dict[str, Any], plan: Plan | None = None) -> str:
-    """Short, human-readable summary of a wait_for_turn result for the decider and the LLM fallback."""
+def describe_last_action(last_action: Any) -> str | None:
+    """The server's `last_action` ({action, tick, result, reason?}) as one line, None when absent."""
+    if not isinstance(last_action, dict) or not isinstance(last_action.get("action"), str):
+        return None
+    result = str(last_action.get("result", "unknown"))
+    reason = last_action.get("reason")
+    outcome = f"{result} ({reason})" if reason else result
+    return f"outcome of your previous action: {last_action['action']} at tick {last_action.get('tick', '?')} -> {outcome}"
+
+
+def render_state(
+    turn: dict[str, Any],
+    plan: Plan | None = None,
+    map_info: MapInfo | None = None,
+    include_last_action: bool = False,
+) -> str:
+    """Short, human-readable summary of a wait_for_turn result for the decider and the LLM fallback.
+
+    Where we stand relative to the fields needs `map_info` (the turn no longer carries `fields`); without it
+    the position is shown plainly rather than guessed.
+
+    The server's `last_action` is rendered only with `include_last_action` (the LLM fallback): the decider is a
+    trained model and its input text must not change until that wording has been evaluated.
+    """
     state = _state(turn)
     me = _my_position(state)
     lines = [f"tick: {extract_tick(turn)}"]
 
     if me is not None:
-        if _in_my_field(state):
-            where = "in your own field"
-        elif me[0] == (state.get("fields") or {}).get("neutral_x"):
-            where = "on the neutral line"
-        else:
-            where = "in the enemy field"
-        lines.append(f"you: {state.get('self')} ({_my_team(state)}) at {me}, {where}")
+        where = ""
+        if map_info is not None:
+            if _in_my_field(state, map_info):
+                where = ", in your own field"
+            elif me[0] == map_info.neutral_x:
+                where = ", on the neutral line"
+            else:
+                where = ", in the enemy field"
+        lines.append(f"you: {state.get('self')} ({_my_team(state)}) at {me}{where}")
     lines.append(f"carrying the flag: {'yes' if _carrying(state) else 'no'}")
+    last_action = describe_last_action(turn.get("last_action")) if include_last_action else None
+    if last_action:
+        lines.append(last_action)
     if _plan_active(plan):
         lines.append(_plan_line(turn, plan))
 
@@ -775,6 +863,35 @@ def ask_serialized(decider: Decider, state: str, questions: dict[str, dict[str, 
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
+def describe_match_over(turn: dict[str, Any]) -> str:
+    """One log line for a `match_over` result. `winner` is null when the match was stopped early."""
+    reason = turn.get("reason") if isinstance(turn.get("reason"), str) else "unknown"
+    winner = turn.get("winner")
+    verdict = f"winner {winner}" if isinstance(winner, str) and winner else "no winner"
+    score = turn.get("score")
+    tail = ", score " + ", ".join(f"{k} {v}" for k, v in score.items()) if isinstance(score, dict) else ""
+    return f"match over ({reason}): {verdict}{tail}"
+
+
+def action_rejection(outcome: dict[str, Any]) -> str | None:
+    """The reason of a rejected action ack (`status: rejected`), `unknown` if it has none; None otherwise.
+
+    Rejections are normal results, not MCP errors. New in v2: `match_over`, `match_not_started`, `not_joined`.
+    """
+    if outcome.get("status") != "rejected":
+        return None
+    reason = outcome.get("reason")
+    return reason if isinstance(reason, str) and reason else "unknown"
+
+
+def report_outcome(outcome: dict[str, Any]) -> None:
+    """Print a tool error or a rejected action ack (a normal result with a reason, not an MCP error)."""
+    if outcome["_is_error"]:
+        print(f"    action error: {outcome}")
+    elif action_rejection(outcome):
+        print(f"    action rejected: {action_rejection(outcome)}")
+
+
 class Stats:
     def __init__(self) -> None:
         self.decider_ticks = 0
@@ -800,15 +917,24 @@ def call_tool(client: MCPClient, name: str, arguments: dict[str, Any]) -> dict[s
     return parsed
 
 
-def join(client: MCPClient, match: str, name: str) -> str:
-    """Join as red first, then blue. Returns the team joined."""
+def join(client: MCPClient, match: str, name: str) -> tuple[str, MapInfo | None]:
+    """Join as red first, then blue. Returns the team joined and the static map (None if absent)."""
     for team in ("red", "blue"):
         outcome = call_tool(client, TOOL_JOIN, {"match_id": match, "team": team, "name": name})
         if not outcome["_is_error"]:
             print(f"joined match {match} as {name} on team {team}")
-            return team
+            return team, parse_map(outcome.get("map"))
         print(f"join as {team} failed: {outcome}")
     raise RuntimeError(f"could not join match {match} on either team")
+
+
+def fetch_map(client: MCPClient) -> MapInfo | None:
+    """The static map from `get_map`: the fallback when `join_match` did not carry it."""
+    outcome = call_tool(client, TOOL_GET_MAP, {})
+    if outcome["_is_error"]:
+        print(f"get_map failed: {outcome}")
+        return None
+    return parse_map(outcome)
 
 
 def run_llm_tick(agent_factory, state: str, tick: int,
@@ -861,13 +987,17 @@ def play(client: MCPClient, decider: Decider, args: argparse.Namespace) -> Stats
     if not args.no_warmup and not warm_up(decider):
         decider_down = True
 
-    join(client, args.match, sanitize_name(args.name))
+    _, map_info = join(client, args.match, sanitize_name(args.name))
+    if map_info is None:  # an older server: fetch the static map once instead
+        map_info = fetch_map(client)
+    if map_info is None:
+        print("warning: no static map (join_match.map / get_map): field-dependent hints are off")
 
     while True:
         turn = call_tool(client, TOOL_WAIT_FOR_TURN, {})
         status = turn.get("status")
         if status == "match_over":
-            print(f"match over: {json.dumps({k: v for k, v in turn.items() if not k.startswith('_')})}")
+            print(describe_match_over(turn))
             return stats
         if status != "turn":  # 'pending' (nothing arrived within the wait cap) or an error
             if turn["_is_error"]:
@@ -879,8 +1009,8 @@ def play(client: MCPClient, decider: Decider, args: argparse.Namespace) -> Stats
 
         tick = extract_tick(turn)
         turn_received = time.monotonic()
-        state = render_state(turn, plan)
-        options = build_options(turn, plan)
+        state = render_state(turn, plan, map_info)
+        options = build_options(turn, plan, map_info)
         if args.raw_turns:
             print(f"[tick {tick}] raw turn:\n{json.dumps(turn, indent=2, ensure_ascii=False)}")
             print(f"[tick {tick}] state sent to decider:\n{state}")
@@ -927,8 +1057,7 @@ def play(client: MCPClient, decider: Decider, args: argparse.Namespace) -> Stats
                 print(f"[tick {tick}] budget: {remaining:.0f} ms left < "
                       f"{args.llm_budget_ms + args.safety_margin_ms:.0f} ms needed for LLM -> "
                       f"executing decider choice {chosen} ({confidence:.2f}){plan_suffix(plan)}")
-            if outcome["_is_error"]:
-                print(f"    action error: {outcome}")
+            report_outcome(outcome)
             continue
 
         if path == "wait":
@@ -938,8 +1067,7 @@ def play(client: MCPClient, decider: Decider, args: argparse.Namespace) -> Stats
             why = "decider unavailable" if decider_down else f"no valid decider choice ({chosen}, {confidence:.2f})"
             print(f"[tick {tick}] budget: {remaining:.0f} ms left < "
                   f"{args.llm_budget_ms + args.safety_margin_ms:.0f} ms needed for LLM, {why} -> wait")
-            if outcome["_is_error"]:
-                print(f"    action error: {outcome}")
+            report_outcome(outcome)
             continue
 
         reason = "decider unavailable" if decider_down else f"low confidence ({chosen}, {confidence:.2f})"
@@ -948,9 +1076,10 @@ def play(client: MCPClient, decider: Decider, args: argparse.Namespace) -> Stats
         llm_started = time.monotonic()
         limit_ms = llm_timeout_s(turn_remaining_ms(turn, (llm_started - turn_received) * 1000),
                                  args.safety_margin_ms) * 1000
+        llm_state = render_state(turn, plan, map_info, include_last_action=True)  # fallback-only text
         handler = TickCancelHandler(threading.Event())
         timed_out, llm_result = run_with_timeout(
-            lambda: run_llm_tick(agent_factory, state, tick, handler), limit_ms / 1000)
+            lambda: run_llm_tick(agent_factory, llm_state, tick, handler), limit_ms / 1000)
         if timed_out:
             already_acted = handler.cancel_tick()  # BEFORE any fallback action
             stats.llm_ticks -= 1
@@ -974,8 +1103,7 @@ def play(client: MCPClient, decider: Decider, args: argparse.Namespace) -> Stats
                                route_path(turn, route_id), _my_position(_state(turn)))
             verdict = f"executing decider choice {chosen} ({confidence:.2f})" if action == "decider" else "wait"
             print(f"{waited} -> {verdict}{plan_suffix(plan)}")
-            if outcome["_is_error"]:
-                print(f"    action error: {outcome}")
+            report_outcome(outcome)
             continue
         calls, call = llm_result
         print(f"[tick {tick}] timing: LLM wall {(time.monotonic() - llm_started) * 1000:.0f} ms, "

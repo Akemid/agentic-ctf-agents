@@ -34,8 +34,6 @@ def make_turn(me=(14, 7), enemy=(1, 7), carrying=None, moves=None, flag_carried_
         "status": "turn", "tick": tick, "deadline_ms": 15000, "deadline_remaining_ms": 15000,
         "state": {
             "tick": tick,
-            "grid": {"width": 15, "height": 15},
-            "walls": [{"x": 0, "y": 2}, {"x": 1, "y": 3}],
             "agents": [
                 {"id": "blue-1", "team": "blue", "position": {"x": me[0], "y": me[1]},
                  "carrying": carrying, "disconnected": False},
@@ -43,11 +41,10 @@ def make_turn(me=(14, 7), enemy=(1, 7), carrying=None, moves=None, flag_carried_
                  "carrying": None, "disconnected": False},
             ],
             "flags": [
-                {"team": "red", "base": {"x": 1, "y": 7}, "position": {"x": 1, "y": 7}, "carried_by": flag_carried_by},
-                {"team": "blue", "base": {"x": 13, "y": 7}, "position": {"x": 13, "y": 7}, "carried_by": None},
+                {"team": "red", "position": {"x": 1, "y": 7}, "carried_by": flag_carried_by},
+                {"team": "blue", "position": {"x": 13, "y": 7}, "carried_by": None},
             ],
             "score": {"red": 0, "blue": 0},
-            "fields": {"red": {"min_x": 0, "max_x": 6}, "blue": {"min_x": 8, "max_x": 14}, "neutral_x": 7},
             "self": "blue-1",
             "self_position": {"x": me[0], "y": me[1]},
             "moves": moves or {"up": "open", "down": "open", "left": "open", "right": "out_of_bounds"},
@@ -56,6 +53,23 @@ def make_turn(me=(14, 7), enemy=(1, 7), carrying=None, moves=None, flag_carried_
         "events": [{"type": "moved", "agent_id": "red-1", "from": {"x": 0, "y": 7}, "to": {"x": 1, "y": 7}}],
         "_is_error": False,
     }
+
+# The static map as `join_match.map` / `get_map` return it: the turn state no longer carries it.
+MAP = loop.parse_map({
+    "grid": {"width": 15, "height": 15},
+    "walls": [{"x": 0, "y": 2}, {"x": 1, "y": 3}],
+    "fields": {"red": {"min_x": 0, "max_x": 6}, "blue": {"min_x": 8, "max_x": 14}, "neutral_x": 7},
+    "flag_bases": {"red": {"x": 1, "y": 7}, "blue": {"x": 13, "y": 7}},
+})
+
+
+def build_options(turn, plan=None):
+    return loop.build_options(turn, plan, MAP)
+
+
+def render_state(turn, plan=None, **kwargs):
+    return loop.render_state(turn, plan, MAP, **kwargs)
+
 
 TURN = make_turn()
 
@@ -89,76 +103,76 @@ class TestBuildOptionsFallback(unittest.TestCase):
     """No `routes` in the state: the agent falls back to per-direction options."""
 
     def test_out_of_bounds_move_excluded(self):
-        opts = loop.build_options(TURN)
+        opts = build_options(TURN)
         self.assertNotIn("move_right", opts)
         for d in ("up", "down", "left"):
             self.assertIn(f"move_{d}", opts)
 
     def test_wall_move_excluded(self):
         turn = make_turn(moves={"up": "wall", "down": "open", "left": "open", "right": "open"})
-        self.assertNotIn("move_up", loop.build_options(turn))
+        self.assertNotIn("move_up", build_options(turn))
 
     def test_wait_always_present(self):
-        self.assertIn("wait", loop.build_options({"state": {}}))
-        self.assertIn("wait", loop.build_options(TURN))
+        self.assertIn("wait", build_options({"state": {}}))
+        self.assertIn("wait", build_options(TURN))
 
     def test_no_moves_when_state_missing(self):
-        self.assertEqual(list(loop.build_options({})), ["wait"])
+        self.assertEqual(list(build_options({})), ["wait"])
 
     def test_empty_routes_falls_back_to_moves(self):
         turn = make_turn()
         turn["state"]["routes"] = []
-        self.assertEqual(list(loop.build_options(turn)), ["move_up", "move_down", "move_left", "wait"])
+        self.assertEqual(list(build_options(turn)), ["move_up", "move_down", "move_left", "wait"])
 
     def test_tag_when_adjacent_and_in_own_field(self):
-        self.assertIn("tag_red-1", loop.build_options(make_turn(me=(8, 7), enemy=(8, 6))))
+        self.assertIn("tag_red-1", build_options(make_turn(me=(8, 7), enemy=(8, 6))))
 
     def test_no_tag_when_adjacent_but_outside_own_field(self):
-        self.assertNotIn("tag_red-1", loop.build_options(make_turn(me=(7, 7), enemy=(6, 7))))
+        self.assertNotIn("tag_red-1", build_options(make_turn(me=(7, 7), enemy=(6, 7))))
 
     def test_no_tag_when_in_field_but_not_adjacent(self):
-        self.assertNotIn("tag_red-1", loop.build_options(make_turn(me=(9, 7), enemy=(9, 9))))
+        self.assertNotIn("tag_red-1", build_options(make_turn(me=(9, 7), enemy=(9, 9))))
 
     def test_no_tag_when_diagonal(self):
-        self.assertNotIn("tag_red-1", loop.build_options(make_turn(me=(9, 7), enemy=(10, 8))))
+        self.assertNotIn("tag_red-1", build_options(make_turn(me=(9, 7), enemy=(10, 8))))
 
     def test_no_tag_for_disconnected_enemy(self):
         turn = make_turn(me=(8, 7), enemy=(8, 6))
         turn["state"]["agents"][1]["disconnected"] = True
-        self.assertNotIn("tag_red-1", loop.build_options(turn))
+        self.assertNotIn("tag_red-1", build_options(turn))
 
     def test_no_tag_for_teammate(self):
         turn = make_turn(me=(8, 7), enemy=(8, 6))
         turn["state"]["agents"][1]["team"] = "blue"
-        self.assertNotIn("tag_red-1", loop.build_options(turn))
+        self.assertNotIn("tag_red-1", build_options(turn))
 
     def test_grab_flag_only_on_enemy_flag_cell(self):
-        self.assertIn("grab_flag", loop.build_options(make_turn(me=(1, 7), enemy=(5, 5))))
-        self.assertNotIn("grab_flag", loop.build_options(make_turn(me=(2, 7), enemy=(5, 5))))
+        self.assertIn("grab_flag", build_options(make_turn(me=(1, 7), enemy=(5, 5))))
+        self.assertNotIn("grab_flag", build_options(make_turn(me=(2, 7), enemy=(5, 5))))
 
     def test_no_grab_flag_when_flag_already_carried(self):
         turn = make_turn(me=(1, 7), enemy=(5, 5), flag_carried_by="red-1")
-        self.assertNotIn("grab_flag", loop.build_options(turn))
+        self.assertNotIn("grab_flag", build_options(turn))
 
     def test_observation_fallback_when_state_missing(self):
         turn = {"tick": 1, "observation": {"self": "x", "moves": {"up": "open", "down": "wall",
                                                                   "left": "wall", "right": "wall"}}}
-        opts = loop.build_options(turn)
+        opts = build_options(turn)
         self.assertIn("move_up", opts)
         self.assertNotIn("move_down", opts)
 
 
 DETOUR = {"id": "enemy_flag_detour", "goal": "enemy_flag", "first_step": "down", "length": 8,
           "path": [{"x": 7, "y": 8}], "blocked_now": False, "blocked_reason": None,
-          "risks": [], "min_enemy_distance": 2}
+          "risks": [], "closest_threat": {"enemy_id": "blue-1", "step": 1, "distance": 2}}
 DIRECT = {"id": "enemy_flag_direct", "goal": "enemy_flag", "first_step": "right", "length": 6,
           "path": [{"x": 8, "y": 7}], "blocked_now": True, "blocked_reason": "contention",
           "risks": [{"cell": {"x": 8, "y": 7}, "step": 1, "enemy_id": "blue-1"}],
-          "min_enemy_distance": 1}
+          "closest_threat": {"enemy_id": "blue-1", "step": 1, "distance": 1}}
 TAG_ADJACENT = {"id": "tag:blue-2", "goal": "tag", "first_step": None, "length": 0, "path": [],
-                "blocked_now": False, "blocked_reason": None, "risks": [], "min_enemy_distance": 1}
+                "blocked_now": False, "blocked_reason": None, "risks": [], "closest_threat": {"enemy_id": "blue-1", "step": 1, "distance": 1}}
 TAG_FAR = {"id": "tag:blue-1", "goal": "tag", "first_step": "up", "length": 3, "path": [],
-           "blocked_now": False, "blocked_reason": None, "risks": [], "min_enemy_distance": 2}
+           "blocked_now": False, "blocked_reason": None, "risks": [], "closest_threat": {"enemy_id": "blue-1", "step": 1, "distance": 2}}
 
 
 def make_route_turn(routes=None, me=(7, 7), enemy=(8, 6), events=None, tick=7):
@@ -170,46 +184,46 @@ def make_route_turn(routes=None, me=(7, 7), enemy=(8, 6), events=None, tick=7):
 
 class TestRouteOptions(unittest.TestCase):
     def test_one_option_per_route_plus_wait(self):
-        opts = loop.build_options(make_route_turn())
+        opts = build_options(make_route_turn())
         self.assertEqual(list(opts), ["enemy_flag_detour", "enemy_flag_direct", "wait"])
 
     def test_no_per_direction_options_when_routes_exist(self):
-        opts = loop.build_options(make_route_turn())
+        opts = build_options(make_route_turn())
         self.assertFalse([k for k in opts if k.startswith("move_")])
 
     def test_description_mentions_blocked_and_risk_facts(self):
-        text = loop.build_options(make_route_turn())["enemy_flag_direct"]
+        text = build_options(make_route_turn())["enemy_flag_direct"]
         self.assertIn("goal enemy_flag", text)
         self.assertIn("6 steps", text)
         self.assertIn("first step right", text)
         self.assertIn("BLOCKED now (contention)", text)
         self.assertIn("1 risk: can be tagged by blue-1 at step 1", text)
-        self.assertIn("nearest enemy 1", text)
+        self.assertIn("closest threat blue-1 at step 1, distance 1", text)
 
     def test_unblocked_riskless_description(self):
-        text = loop.build_options(make_route_turn())["enemy_flag_detour"]
+        text = build_options(make_route_turn())["enemy_flag_detour"]
         self.assertIn("8 steps", text)
         self.assertNotIn("BLOCKED", text)
         self.assertNotIn("risk", text)
 
     def test_no_recommendation_wording(self):
-        blob = " ".join(loop.build_options(make_route_turn()).values()) + loop.render_state(make_route_turn())
+        blob = " ".join(build_options(make_route_turn()).values()) + render_state(make_route_turn())
         for word in ("recommend", "suggest"):
             self.assertNotIn(word, blob.lower())
 
     def test_adjacent_tag_route_description(self):
-        text = loop.build_options(make_route_turn(routes=[TAG_ADJACENT]))["tag:blue-2"]
+        text = build_options(make_route_turn(routes=[TAG_ADJACENT]))["tag:blue-2"]
         self.assertIn("goal tag blue-2", text)
         self.assertIn("adjacent now: tag immediately", text)
 
     def test_grab_flag_still_offered_on_the_flag_cell(self):
         turn = make_route_turn(me=(13, 7))
-        self.assertIn("grab_flag", loop.build_options(turn))
-        self.assertNotIn("grab_flag", loop.build_options(make_route_turn()))
+        self.assertIn("grab_flag", build_options(turn))
+        self.assertNotIn("grab_flag", build_options(make_route_turn()))
 
     def test_malformed_routes_are_ignored(self):
         turn = make_route_turn(routes=[{"nope": 1}, "x", DETOUR])
-        self.assertEqual(list(loop.build_options(turn)), ["enemy_flag_detour", "wait"])
+        self.assertEqual(list(build_options(turn)), ["enemy_flag_detour", "wait"])
 
 
 class TestLabelToCall(unittest.TestCase):
@@ -243,7 +257,7 @@ class TestLabelToCall(unittest.TestCase):
     def _arrived(self, route_id, goal):
         # Real tick-16 shape: standing on the target, the server sends length 0 and first_step null.
         return {"id": route_id, "goal": goal, "first_step": None, "length": 0, "path": [],
-                "blocked_now": False, "blocked_reason": None, "risks": [], "min_enemy_distance": 12}
+                "blocked_now": False, "blocked_reason": None, "risks": [], "closest_threat": {"enemy_id": "blue-1", "step": 0, "distance": 12}}
 
     def test_arrived_enemy_flag_route_maps_to_grab_flag(self):
         turn = make_route_turn(routes=[self._arrived("enemy_flag_direct", "enemy_flag")], me=(13, 7))
@@ -308,7 +322,7 @@ class TestMisc(unittest.TestCase):
 
 class TestRenderState(unittest.TestCase):
     def test_contains_key_facts_without_client_hints(self):
-        text = loop.render_state(TURN)
+        text = render_state(TURN)
         self.assertIn("tick: 1", text)
         self.assertIn("blue-1", text)
         self.assertIn("(14, 7)", text)
@@ -318,42 +332,42 @@ class TestRenderState(unittest.TestCase):
         self.assertNotIn("target:", text)
 
     def test_has_no_walls(self):
-        text = loop.render_state(TURN)
+        text = render_state(TURN)
         self.assertNotIn("walls", text)
         self.assertNotIn('"x"', text)
         self.assertLess(len(text), 1200)
 
     def test_carrying(self):
-        text = loop.render_state(make_turn(me=(9, 7), carrying="red", flag_carried_by="blue-1"))
+        text = render_state(make_turn(me=(9, 7), carrying="red", flag_carried_by="blue-1"))
         self.assertIn("carrying the flag: yes", text)
 
     def test_field_membership(self):
-        self.assertIn("in your own field", loop.render_state(make_turn(me=(9, 7))))
-        self.assertIn("in the enemy field", loop.render_state(make_turn(me=(3, 7))))
-        self.assertIn("on the neutral line", loop.render_state(make_turn(me=(7, 7))))
+        self.assertIn("in your own field", render_state(make_turn(me=(9, 7))))
+        self.assertIn("in the enemy field", render_state(make_turn(me=(3, 7))))
+        self.assertIn("on the neutral line", render_state(make_turn(me=(7, 7))))
 
     def test_routes_block_lists_route_facts(self):
-        text = loop.render_state(make_route_turn())
+        text = render_state(make_route_turn())
         self.assertIn("routes:", text)
         self.assertIn("enemy_flag_detour: goal enemy_flag, 8 steps", text)
         self.assertIn("enemy_flag_direct: goal enemy_flag, 6 steps, first step right, BLOCKED now (contention)", text)
         self.assertIn("can be tagged by blue-1 at step 1", text)
 
     def test_moves_line_only_when_routes_empty(self):
-        self.assertNotIn("moves:", loop.render_state(make_route_turn()))
-        self.assertIn("moves:", loop.render_state(make_route_turn(routes=[])))
-        self.assertNotIn("routes:", loop.render_state(make_route_turn(routes=[])))
+        self.assertNotIn("moves:", render_state(make_route_turn()))
+        self.assertIn("moves:", render_state(make_route_turn(routes=[])))
+        self.assertNotIn("routes:", render_state(make_route_turn(routes=[])))
 
     def test_no_client_side_risk_lines(self):
-        self.assertNotIn("risk: move", loop.render_state(make_route_turn(routes=[])))
+        self.assertNotIn("risk: move", render_state(make_route_turn(routes=[])))
 
     def test_blocked_event_rendered_in_full(self):
-        text = loop.render_state(make_route_turn())
+        text = render_state(make_route_turn())
         self.assertIn("move_blocked red-1 right -> (8, 7): contention", text)
 
     def test_other_events_keep_meaningful_fields(self):
         events = [{"type": "tagged", "agent_id": "blue-1", "target_id": "red-2", "position": {"x": 9, "y": 4}}]
-        text = loop.render_state(make_route_turn(events=events))
+        text = render_state(make_route_turn(events=events))
         self.assertIn("tagged blue-1", text)
         self.assertIn("target_id=red-2", text)
         self.assertIn("position=(9, 4)", text)
@@ -376,12 +390,11 @@ def make_deadlock_turn(me=(7, 7), enemy=(8, 6), target=(13, 7), events=None, tic
                  "carrying": None, "disconnected": False},
             ],
             "flags": [
-                {"team": "red", "base": {"x": 1, "y": 7}, "position": {"x": 1, "y": 7}, "carried_by": None},
-                {"team": "blue", "base": {"x": 13, "y": 7}, "position": {"x": target[0], "y": target[1]},
+                {"team": "red", "position": {"x": 1, "y": 7}, "carried_by": None},
+                {"team": "blue", "position": {"x": target[0], "y": target[1]},
                  "carried_by": None},
             ],
             "score": {"red": 0, "blue": 0},
-            "fields": {"red": {"min_x": 0, "max_x": 6}, "blue": {"min_x": 8, "max_x": 14}, "neutral_x": 7},
             "self": "red-1",
             "self_position": {"x": me[0], "y": me[1]},
             "moves": {"up": "open", "down": "open", "left": "open", "right": "open"},
@@ -406,7 +419,7 @@ def cells(*xy):
 
 def path_route(route_id, goal, path, first_step="right"):
     return {"id": route_id, "goal": goal, "first_step": first_step, "length": len(path), "path": cells(*path),
-            "blocked_now": False, "blocked_reason": None, "risks": [], "min_enemy_distance": 5}
+            "blocked_now": False, "blocked_reason": None, "risks": [], "closest_threat": {"enemy_id": "blue-1", "step": 1, "distance": 5}}
 
 
 # Real regression: plan chosen at (2,7) heading right along y=7 (8 cells, current cell excluded).
@@ -534,31 +547,31 @@ PLAN = loop.Plan("enemy_flag_direct", "enemy_flag", 5, "move down")
 class TestRenderStatePlan(unittest.TestCase):
     def test_no_plan_output_unchanged(self):
         turn = make_route_turn()
-        self.assertEqual(loop.render_state(turn, None), loop.render_state(turn))
-        self.assertNotIn("current plan", loop.render_state(turn))
-        self.assertNotIn("current plan", loop.render_state(turn, loop.Plan()))
+        self.assertEqual(render_state(turn, None), render_state(turn))
+        self.assertNotIn("current plan", render_state(turn))
+        self.assertNotIn("current plan", render_state(turn, loop.Plan()))
 
     def test_plan_line_when_a_route_continues_the_path(self):
-        text = loop.render_state(reg_turn(), reg_plan())
+        text = render_state(reg_turn(), reg_plan())
         self.assertIn(
             "current plan: goal enemy_flag, heading to (10, 7) since tick 5, 1 tick; last action: move right", text)
         self.assertNotIn("no offered route", text)
 
     def test_plan_line_when_no_route_continues_the_path(self):
         detour_only = [reg_turn()["state"]["routes"][1]]
-        text = loop.render_state(reg_turn(routes=detour_only), reg_plan())
+        text = render_state(reg_turn(routes=detour_only), reg_plan())
         self.assertIn(
             "current plan: goal enemy_flag, heading to (10, 7) since tick 5 \u2014 no offered route continues that path",
             text)
         self.assertNotIn("no longer offered", text)
 
     def test_plan_line_without_known_path(self):
-        text = loop.render_state(make_route_turn(tick=8), PLAN)
+        text = render_state(make_route_turn(tick=8), PLAN)
         self.assertIn("current plan: goal enemy_flag since tick 5", text)
         self.assertNotIn("heading to", text)
 
     def test_plan_wording_is_neutral(self):
-        text = loop.render_state(reg_turn(), reg_plan()).lower()
+        text = render_state(reg_turn(), reg_plan()).lower()
         for word in ("recommend", "should"):
             self.assertNotIn(word, text)
 
@@ -566,11 +579,11 @@ class TestRenderStatePlan(unittest.TestCase):
 class TestBuildOptionsPlan(unittest.TestCase):
     def test_no_plan_unchanged(self):
         turn = make_route_turn()
-        self.assertEqual(loop.build_options(turn, None), loop.build_options(turn))
-        self.assertEqual(loop.build_options(turn, loop.Plan()), loop.build_options(turn))
+        self.assertEqual(build_options(turn, None), build_options(turn))
+        self.assertEqual(build_options(turn, loop.Plan()), build_options(turn))
 
     def test_regression_backwards_detour_is_not_a_continuation(self):
-        opts = loop.build_options(reg_turn(), reg_plan())
+        opts = build_options(reg_turn(), reg_plan())
         self.assertTrue(opts["enemy_flag_direct"].endswith(" | continues your current path (1 tick)"))
         self.assertTrue(opts["enemy_flag_detour"].endswith(" | same goal as your current plan, different path"))
         self.assertNotIn("continues", opts["enemy_flag_detour"])
@@ -579,7 +592,7 @@ class TestBuildOptionsPlan(unittest.TestCase):
         # The direct route now goes backwards; only the differently named route continues the path.
         direct = path_route("enemy_flag_direct", "enemy_flag", [(2, 7), (2, 6)], first_step="left")
         other = path_route("enemy_flag_alt", "enemy_flag", [(x, 7) for x in range(4, 12)])
-        opts = loop.build_options(reg_turn(routes=[direct, other]), reg_plan())
+        opts = build_options(reg_turn(routes=[direct, other]), reg_plan())
         self.assertIn("different path", opts["enemy_flag_direct"])
         self.assertIn("continues your current path", opts["enemy_flag_alt"])
 
@@ -587,13 +600,13 @@ class TestBuildOptionsPlan(unittest.TestCase):
         # I did not move: still at (2,7); the route that starts with the previous path continues.
         direct = path_route("enemy_flag_direct", "enemy_flag", list(PREV_PATH))
         detour = path_route("enemy_flag_detour", "enemy_flag", [(1, 7), (0, 7)], first_step="left")
-        opts = loop.build_options(reg_turn(me=(2, 7), tick=6, routes=[direct, detour]), reg_plan())
+        opts = build_options(reg_turn(me=(2, 7), tick=6, routes=[direct, detour]), reg_plan())
         self.assertIn("continues your current path", opts["enemy_flag_direct"])
         self.assertIn("different path", opts["enemy_flag_detour"])
 
     def test_respawn_case_nothing_continues(self):
         direct = path_route("enemy_flag_direct", "enemy_flag", [(13, 7), (12, 7)], first_step="left")
-        opts = loop.build_options(reg_turn(me=(14, 7), tick=9, routes=[direct]), reg_plan())
+        opts = build_options(reg_turn(me=(14, 7), tick=9, routes=[direct]), reg_plan())
         self.assertNotIn("continues", opts["enemy_flag_direct"])
         self.assertIn("different path", opts["enemy_flag_direct"])
 
@@ -601,24 +614,24 @@ class TestBuildOptionsPlan(unittest.TestCase):
         a = path_route("a_route", "enemy_flag", [(x, 7) for x in range(4, 12)])
         b = path_route("b_route", "enemy_flag", [(4, 7), (5, 7), (5, 8)])  # diverges after 2 cells -> no
         c = path_route("c_route", "enemy_flag", [(x, 7) for x in range(4, 8)])
-        opts = loop.build_options(reg_turn(routes=[a, b, c]), reg_plan())
+        opts = build_options(reg_turn(routes=[a, b, c]), reg_plan())
         self.assertIn("continues your current path", opts["a_route"])
         self.assertIn("different path", opts["b_route"])
         self.assertIn("continues your current path", opts["c_route"])
 
     def test_zero_routes_continue(self):
-        opts = loop.build_options(reg_turn(routes=[reg_turn()["state"]["routes"][1]]), reg_plan())
+        opts = build_options(reg_turn(routes=[reg_turn()["state"]["routes"][1]]), reg_plan())
         self.assertNotIn("continues", " ".join(opts.values()))
 
     def test_other_goals_and_wait_unchanged(self):
         turn = reg_turn(routes=reg_turn()["state"]["routes"] + [TAG_FAR])
-        base, opts = loop.build_options(turn), loop.build_options(turn, reg_plan())
+        base, opts = build_options(turn), build_options(turn, reg_plan())
         self.assertEqual(opts["tag:blue-1"], base["tag:blue-1"])
         self.assertEqual(opts["wait"], base["wait"])
 
     def test_labels_and_order_unchanged(self):
         turn = reg_turn()
-        self.assertEqual(list(loop.build_options(turn, reg_plan())), list(loop.build_options(turn)))
+        self.assertEqual(list(build_options(turn, reg_plan())), list(build_options(turn)))
 
 
 class TestExecutedRouteInference(unittest.TestCase):
@@ -1117,6 +1130,46 @@ class CallToolErrorTests(unittest.TestCase):
     def test_success_not_flagged(self):
         parsed = loop.call_tool(FakeClient(tool_result({"status": "turn", "tick": 1})), "wait_for_turn", {})
         self.assertFalse(parsed["_is_error"])
+
+
+class TestStaticMapV2(unittest.TestCase):
+    """MCP turn contract v2: the static board is captured once, not read from the turn state."""
+
+    RAW = {"fields": {"red": {"min_x": 0, "max_x": 6}, "blue": {"min_x": 8, "max_x": 14}, "neutral_x": 7},
+           "walls": [], "flag_bases": {"red": {"x": 1, "y": 7}, "blue": {"x": 13, "y": 7}}}
+
+    def test_parse_map(self):
+        info = loop.parse_map(self.RAW)
+        self.assertEqual(info.fields, {"red": (0, 6), "blue": (8, 14)})
+        self.assertEqual(info.neutral_x, 7)
+        self.assertEqual(info.flag_bases, {"red": (1, 7), "blue": (13, 7)})
+        for raw in (None, {}, {"fields": {}}, "map"):
+            self.assertIsNone(loop.parse_map(raw))
+
+    def test_without_the_map_the_position_is_not_guessed_and_no_tag_is_invented(self):
+        turn = make_turn(me=(8, 7), enemy=(8, 6))
+        text = loop.render_state(turn, None, None)
+        self.assertIn("at (8, 7)", text)
+        self.assertNotIn("field", text)
+        self.assertNotIn("tag_red-1", loop.build_options(turn, None, None))
+
+    def test_closest_threat_is_described_and_replaces_nearest_enemy(self):
+        route = {"id": "r", "goal": "enemy_flag", "first_step": "up", "length": 2, "closest_threat":
+                 {"enemy_id": "red-1", "step": 3, "distance": 2}}
+        self.assertIn("closest threat red-1 at step 3, distance 2", loop.describe_route(route))
+        self.assertNotIn("threat", loop.describe_route({**route, "closest_threat": None}))
+        self.assertNotIn("threat", loop.describe_route({k: v for k, v in route.items() if k != "closest_threat"}))
+
+    def test_the_servers_last_action_is_fallback_only(self):
+        turn = {**make_turn(), "last_action": {"action": "move:up", "tick": 0, "result": "moved"}}
+        self.assertNotIn("previous action", render_state(turn))
+        self.assertIn("outcome of your previous action: move:up at tick 0 -> moved",
+                      render_state(turn, include_last_action=True))
+
+    def test_match_over_logging_handles_no_winner(self):
+        self.assertEqual(loop.describe_match_over({"status": "match_over", "score": {"red": 0, "blue": 0},
+                                                   "winner": None, "reason": "stopped"}),
+                         "match over (stopped): no winner, score red 0, blue 0")
 
 
 if __name__ == "__main__":

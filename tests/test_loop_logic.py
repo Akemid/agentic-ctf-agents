@@ -35,7 +35,8 @@ def local():
 # --------------------------------------------------------------------------- corpus
 
 
-def route(rid, goal, step, length, *, risks=(), blocked=False, dist=3, path=None):
+def route(rid, goal, step, length, *, risks=(), blocked=False, threat=None, path=None):
+    """A route in the v2 shape: `threat` is (enemy_id, step, distance) for `closest_threat`, or None."""
     return {
         "id": rid,
         "goal": goal,
@@ -45,7 +46,9 @@ def route(rid, goal, step, length, *, risks=(), blocked=False, dist=3, path=None
         "blocked_now": blocked,
         "blocked_reason": "contention" if blocked else None,
         "risks": [{"step": st, "enemy_id": en} for st, en in risks],
-        "min_enemy_distance": dist,
+        "closest_threat": (
+            None if threat is None else {"enemy_id": threat[0], "step": threat[1], "distance": threat[2]}
+        ),
     }
 
 
@@ -69,11 +72,10 @@ def base_state(routes, **overrides):
             agent("red-2", "red", 4, 9),
         ],
         "flags": [
-            {"team": "red", "base": {"x": 1, "y": 7}, "position": {"x": 1, "y": 7}, "carried_by": None},
-            {"team": "blue", "base": {"x": 13, "y": 7}, "position": {"x": 13, "y": 7}, "carried_by": None},
+            {"team": "red", "position": {"x": 1, "y": 7}, "carried_by": None},
+            {"team": "blue", "position": {"x": 13, "y": 7}, "carried_by": None},
         ],
         "score": {"red": 1, "blue": 0},
-        "fields": {"red": {"min_x": 0, "max_x": 6}, "blue": {"min_x": 8, "max_x": 14}, "neutral_x": 7},
         "self": "blue-1",
         "self_position": {"x": 9, "y": 7},
         "teammates": [{"id": "blue-2", "position": {"x": 11, "y": 4}}],
@@ -85,14 +87,47 @@ def base_state(routes, **overrides):
 
 
 def turn_of(state, events=(), **top):
-    return {"status": "turn", "tick": state["tick"], "state": state, "events": list(events), **top}
+    return {
+        "status": "turn",
+        "tick": state["tick"],
+        "state": state,
+        "events": list(events),
+        "last_action": None,
+        **top,
+    }
+
+
+# The static map as `join_match.map` / `get_map` return it (the turn state no longer carries it).
+MAP_RAW = {
+    "grid": {"width": 15, "height": 15},
+    "walls": [{"x": 1, "y": 1}, {"x": 2, "y": 1}],
+    "fields": {"red": {"min_x": 0, "max_x": 6}, "blue": {"min_x": 8, "max_x": 14}, "neutral_x": 7},
+    "flag_bases": {"red": {"x": 1, "y": 7}, "blue": {"x": 13, "y": 7}},
+    "ascii": ["..."],
+    "legend": {"#": "wall"},
+}
 
 
 PATH_A = [{"x": 8, "y": 7}, {"x": 7, "y": 7}, {"x": 6, "y": 7}]
 ROUTES = [
-    route("enemy_flag_direct", "enemy_flag", "left", 8, risks=[(3, "red-1")], dist=2, path=PATH_A),
-    route("enemy_flag_safe", "enemy_flag", "up", 11, dist=4, path=[{"x": 9, "y": 6}, {"x": 9, "y": 5}]),
-    route("tag:red-1", "tag", "left", 4, dist=4),
+    route(
+        "enemy_flag_direct",
+        "enemy_flag",
+        "left",
+        8,
+        risks=[(3, "red-1")],
+        threat=("red-1", 6, 2),
+        path=PATH_A,
+    ),
+    route(
+        "enemy_flag_safe",
+        "enemy_flag",
+        "up",
+        11,
+        threat=("red-2", 3, 4),
+        path=[{"x": 9, "y": 6}, {"x": 9, "y": 5}],
+    ),
+    route("tag:red-1", "tag", "left", 4),
     route("home_base", "own_base", "right", 4, blocked=True),
     route("defend_flag", "defend_flag", None, 0),
 ]
@@ -123,6 +158,13 @@ TURNS = {
     ),
     "carrier": turn_of(CARRIER),
     "no_routes_moves": turn_of(base_state([])),
+    "last_action_blocked": turn_of(
+        base_state(copy.deepcopy(ROUTES)),
+        last_action={"action": "move:left", "tick": 11, "result": "blocked", "reason": "contention"},
+    ),
+    "last_action_moved": turn_of(
+        base_state(copy.deepcopy(ROUTES)), last_action={"action": "move:up", "tick": 11, "result": "moved"}
+    ),
     "on_flag": turn_of(ON_FLAG),
     "adjacent_tag": turn_of(ADJACENT_TAG),
     "zero_length": turn_of(ZERO_LENGTH),
@@ -171,6 +213,11 @@ PLAN_FIELDS = [
 ]
 
 
+def map_for(module, with_map):
+    """The module's own MapInfo for the shared raw map (or None: the map could not be obtained)."""
+    return module.parse_map(MAP_RAW) if with_map else None
+
+
 def make_plan(module, fields):
     return None if fields is None else module.Plan(**fields)
 
@@ -189,23 +236,84 @@ def plan_view(plan):
 class TestStateRendering:
     @pytest.mark.parametrize("name", sorted(TURNS))
     @pytest.mark.parametrize("plan_index", range(len(PLAN_FIELDS)))
-    def test_render_state_matches_the_original(self, local, name, plan_index):
+    @pytest.mark.parametrize("with_map", [True, False])
+    def test_render_state_matches_the_original(self, local, name, plan_index, with_map):
         turn = TURNS[name]
-        assert port.render_state(turn, plans(port)[plan_index]) == local.render_state(
-            turn, plans(local)[plan_index]
+        assert port.render_state(
+            turn, plans(port)[plan_index], map_for(port, with_map)
+        ) == local.render_state(turn, plans(local)[plan_index], map_for(local, with_map))
+
+    @pytest.mark.parametrize("name", sorted(TURNS))
+    @pytest.mark.parametrize("plan_index", range(len(PLAN_FIELDS)))
+    def test_the_fallback_render_matches_the_original(self, local, name, plan_index):
+        turn = TURNS[name]
+        assert port.render_state(
+            turn, plans(port)[plan_index], map_for(port, True), include_last_action=True
+        ) == local.render_state(
+            turn, plans(local)[plan_index], map_for(local, True), include_last_action=True
         )
 
     def test_the_rendered_state_has_the_expected_facts(self):
-        text = port.render_state(TURNS["routes"], None)
+        text = port.render_state(TURNS["routes"], None, map_for(port, True))
         assert text.splitlines()[0] == "tick: 12"
-        assert "you: blue-1 (blue) at (9, 7), in your own field" in text
+        assert "you: blue-1 (blue) at (9, 7), in your own field" in text  # blue field is x 8..14
         assert "carrying the flag: no" in text
         assert "enemy red-1 at (5, 6), carrying: no" in text
         assert (
             "  enemy_flag_direct: goal enemy_flag, 8 steps, first step left, "
-            "1 risk: can be tagged by red-1 at step 3, nearest enemy 2" in text
+            "1 risk: can be tagged by red-1 at step 3, closest threat red-1 at step 6, distance 2" in text
         )
+        assert "  tag:red-1: goal tag red-1, 4 steps, first step left" in text.splitlines()
         assert "recent events: moved red-1 (6, 6)->(5, 6)" in text
+
+    def test_the_position_comes_from_the_static_map_not_from_the_turn(self):
+        # `fields` is not in the turn state any more: the same turn is placed differently by different maps.
+        turn = TURNS["routes"]  # blue-1 stands at x=9
+        assert "at (9, 7), in your own field" in port.render_state(turn, None, map_for(port, True))
+        far_blue = port.parse_map(
+            {**MAP_RAW, "fields": {**MAP_RAW["fields"], "blue": {"min_x": 12, "max_x": 14}}}
+        )
+        assert "at (9, 7), in the enemy field" in port.render_state(turn, None, far_blue)
+        on_line = {**turn, "state": {**turn["state"], "self_position": {"x": 7, "y": 3}}}
+        assert "at (7, 3), on the neutral line" in port.render_state(on_line, None, map_for(port, True))
+
+    def test_without_the_map_the_position_is_not_guessed(self):
+        text = port.render_state(TURNS["routes"], None, None)
+        assert "you: blue-1 (blue) at (9, 7)" in text
+        assert "own field" not in text and "enemy field" not in text and "neutral" not in text
+
+    def test_the_decider_text_never_carries_the_servers_last_action(self):
+        # The decider is a trained model: its input only changes where the contract forces it.
+        for name in ("last_action_blocked", "last_action_moved", "routes"):
+            text = port.render_state(TURNS[name], None, map_for(port, True))
+            assert "previous action" not in text and "last action result" not in text
+        state, _ = port.warmup_question()
+        assert "previous action" not in state and "last action result" not in state
+
+    def test_the_fallback_text_reports_the_servers_last_action_when_present(self):
+        full_map = map_for(port, True)
+        text = port.render_state(TURNS["last_action_blocked"], None, full_map, include_last_action=True)
+        assert "outcome of your previous action: move:left at tick 11 -> blocked (contention)" in text
+        moved = port.render_state(TURNS["last_action_moved"], None, full_map, include_last_action=True)
+        assert "outcome of your previous action: move:up at tick 11 -> moved" in moved
+        plain = port.render_state(TURNS["routes"], None, map_for(port, True), include_last_action=True)
+        assert "previous action" not in plain  # first turn: null
+
+    def test_the_fallback_label_does_not_clash_with_the_plan_line(self):
+        plan = plans(port)[1]
+        full_map = map_for(port, True)
+        text = port.render_state(TURNS["last_action_moved"], plan, full_map, include_last_action=True)
+        assert text.count("last action:") <= 1  # only the plan line's own `last action:`
+        assert "outcome of your previous action:" in text
+
+    def test_a_route_without_closest_threat_is_described_without_one(self):
+        old_server_route = {"id": "r", "goal": "enemy_flag", "first_step": "up", "length": 2}
+        assert port.describe_route(old_server_route) == "goal enemy_flag, 2 steps, first step up"
+        # a null threat is missing data, exactly like an absent key: no clause at all (not "no threat")
+        assert port.describe_route({**old_server_route, "closest_threat": None}) == (
+            "goal enemy_flag, 2 steps, first step up"
+        )
+        assert "min_enemy_distance" not in port.describe_route({**old_server_route, "min_enemy_distance": 3})
 
     def test_extract_tick_prefers_the_top_level_then_the_state(self, local):
         assert (
@@ -221,10 +329,11 @@ class TestStateRendering:
 class TestOptionsAndCalls:
     @pytest.mark.parametrize("name", sorted(TURNS))
     @pytest.mark.parametrize("plan_index", range(len(PLAN_FIELDS)))
-    def test_build_options_matches_the_original(self, local, name, plan_index):
+    @pytest.mark.parametrize("with_map", [True, False])
+    def test_build_options_matches_the_original(self, local, name, plan_index, with_map):
         turn = TURNS[name]
-        mine = port.build_options(turn, plans(port)[plan_index])
-        theirs = local.build_options(turn, plans(local)[plan_index])
+        mine = port.build_options(turn, plans(port)[plan_index], map_for(port, with_map))
+        theirs = local.build_options(turn, plans(local)[plan_index], map_for(local, with_map))
         assert mine == theirs
         assert "wait" in mine
 
@@ -243,6 +352,12 @@ class TestOptionsAndCalls:
     def test_without_routes_open_directions_become_move_options(self):
         options = port.build_options(TURNS["no_routes_moves"], None)
         assert list(options) == ["move_up", "move_down", "move_right", "wait"]
+
+    def test_the_adjacent_tag_fallback_needs_the_map_to_know_we_stand_in_our_own_field(self):
+        turn = TURNS["adjacent_tag"]  # no routes; a red player at (5, 5) next to an enemy at (5, 6)
+        with_map = port.build_options(turn, None, map_for(port, True))
+        assert with_map["tag_red-1"] == "tag the adjacent enemy red-1 (you are in your own field)"
+        assert not [label for label in port.build_options(turn, None, None) if label.startswith("tag_")]
 
     def test_grab_flag_is_offered_only_when_standing_on_the_enemy_flag(self):
         assert "grab_flag" in port.build_options(TURNS["on_flag"], None)
@@ -293,6 +408,13 @@ class TestQuestionsAndAnswers:
 
     def test_warmup_question_matches_the_original(self, local):
         assert port.warmup_question() == local.warmup_question()
+
+    def test_the_warm_up_state_has_the_v2_shape(self):
+        state, questions = port.warmup_question()
+        assert "closest threat red-1 at step 6, distance 2" in state
+        assert "min_enemy_distance" not in state and "nearest enemy" not in state
+        assert "in your own field" in state  # the warm-up carries its own static map
+        assert set(questions) == {"threat", "route_bad", "action"}
 
     @pytest.mark.parametrize(
         "answer",
@@ -537,9 +659,94 @@ class TestPlanMemory:
         assert port.extract_action_call([]) is None and port.extract_action_call(None) is None
 
 
+class TestStaticMap:
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            MAP_RAW,
+            {**MAP_RAW, "walls": []},
+            {**MAP_RAW, "walls": [{"x": 1}, "x", {"x": 2, "y": 3}]},
+            {**MAP_RAW, "flag_bases": None},
+            {"fields": {"red": {"min_x": 0, "max_x": 3}}},
+            {"fields": {"red": {"min_x": "0", "max_x": 3}, "neutral_x": True}},
+            {"fields": {}},
+            {"grid": {}},
+            {},
+            None,
+            "map",
+            [],
+        ],
+    )
+    def test_parse_map_matches_the_original(self, local, raw):
+        mine, theirs = port.parse_map(raw), local.parse_map(raw)
+        assert (mine is None) == (theirs is None)
+        if mine is not None:
+            assert vars(mine) == vars(theirs)
+
+    def test_parse_map_keeps_what_the_logic_needs(self):
+        info = port.parse_map(MAP_RAW)
+        assert info.fields == {"red": (0, 6), "blue": (8, 14)}
+        assert info.neutral_x == 7
+        assert info.walls == frozenset({(1, 1), (2, 1)})
+        assert info.flag_bases == {"red": (1, 7), "blue": (13, 7)}
+
+    @pytest.mark.parametrize("raw", [None, {}, {"fields": {}}, "map", {"fields": {"neutral_x": 7}}])
+    def test_an_unusable_map_is_none_not_an_exception(self, raw):
+        assert port.parse_map(raw) is None
+
+    def test_malformed_walls_and_bases_are_skipped_not_fatal(self):
+        info = port.parse_map({**MAP_RAW, "walls": [{"x": 1}, "x", {"x": 2, "y": 3}], "flag_bases": None})
+        assert info.walls == frozenset({(2, 3)}) and info.flag_bases == {}
+
+    @pytest.mark.parametrize(
+        "turn",
+        [
+            {"status": "match_over", "score": {"red": 1, "blue": 3}, "winner": "blue", "reason": "completed"},
+            {"status": "match_over", "score": {"red": 0, "blue": 0}, "winner": None, "reason": "stopped"},
+            {"status": "match_over", "score": {"red": 2, "blue": 2}, "winner": "tie", "reason": "completed"},
+            {"status": "match_over"},
+            {"status": "match_over", "winner": None, "_is_error": False},
+        ],
+    )
+    def test_describe_match_over_matches_the_original(self, local, turn):
+        assert port.describe_match_over(turn) == local.describe_match_over(turn)
+
+    def test_describe_match_over_reports_the_reason_and_handles_no_winner(self):
+        done = {
+            "status": "match_over",
+            "score": {"red": 1, "blue": 3},
+            "winner": "blue",
+            "reason": "completed",
+        }
+        assert port.describe_match_over(done) == "match over (completed): winner blue, score red 1, blue 3"
+        stopped = {
+            "status": "match_over",
+            "score": {"red": 0, "blue": 0},
+            "winner": None,
+            "reason": "stopped",
+        }
+        assert port.describe_match_over(stopped) == "match over (stopped): no winner, score red 0, blue 0"
+        assert port.describe_match_over({"status": "match_over"}) == "match over (unknown): no winner"
+
+    @pytest.mark.parametrize(
+        "outcome,expected",
+        [
+            ({"status": "accepted", "tick": 3, "_is_error": False}, None),
+            ({"status": "rejected", "tick": 3, "reason": "match_over", "_is_error": False}, "match_over"),
+            ({"status": "rejected", "tick": 3, "reason": "not_joined", "_is_error": False}, "not_joined"),
+            ({"status": "rejected", "tick": 3, "_is_error": False}, "unknown"),
+            ({"reason": "not_joined", "_is_error": True}, None),
+            ({}, None),
+        ],
+    )
+    def test_action_rejection_names_the_ack_reason(self, local, outcome, expected):
+        assert port.action_rejection(outcome) == expected == local.action_rejection(outcome)
+
+
 class TestMisc:
     def test_constants_match_the_original(self, local):
         for name in (
+            "TOOL_GET_MAP",
             "DEFAULT_THRESHOLD",
             "THREAT_YES",
             "ROUTE_BAD_YES",

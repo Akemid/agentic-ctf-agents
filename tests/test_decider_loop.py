@@ -1,6 +1,7 @@
 """decider_loop play loop: Python owns the loop, the decider picks the action, the LLM is the fallback."""
 
 import json
+import logging
 import threading
 
 import httpx
@@ -14,7 +15,7 @@ from ctf_common.decider import DeciderCircuitOpen, DeciderTimeout, HttpDecider, 
 from ctf_common.mcp import McpAuthError, open_mcp_client
 from ctf_common.payload import Action, MatchRequest
 from ctf_common.runner import MatchContext
-from fake_mcp import FakeGame, in_memory_transport
+from fake_mcp import GRID, MAP, FakeGame, in_memory_transport, make_route
 from fake_model import SequencePlayer
 
 MOVES = {"up": "open", "down": "open", "left": "blocked", "right": "open"}
@@ -96,6 +97,15 @@ def actions(game, name):
     return [a for n, a in game.actions if n == name]
 
 
+# A v2 turn state: no grid/walls/fields/flag bases. We are red-1 at x=3 (the red field is x 0..6).
+POSITIONED = {
+    "moves": MOVES,
+    "self": "red-1",
+    "self_position": {"x": 3, "y": 7},
+    "agents": [{"id": "red-1", "team": "red", "position": {"x": 3, "y": 7}, "carrying": None}],
+}
+
+
 class TestDeciderPath:
     def test_a_confident_decider_picks_every_action_without_the_llm(self):
         game, decider, model = FakeGame(turns=3, state=STATE), FakeDecider(), SequencePlayer([])
@@ -126,6 +136,74 @@ class TestDeciderPath:
         tokens = CountingTokens()
         play_against(FakeGame(turns=10, state=STATE), make_ctx(tokens)[0], FakeDecider(), SequencePlayer([]))
         assert tokens.calls == 1
+
+
+class TestStaticMap:
+    """Contract v2: the board comes once from `join_match.map` (else `get_map`), never from the turn."""
+
+    def test_the_join_result_map_places_us_in_our_field_without_calling_get_map(self):
+        game, decider = FakeGame(turns=1, state=POSITIONED), FakeDecider()
+        play_against(game, make_ctx()[0], decider, SequencePlayer([]))
+        assert "at (3, 7), in your own field" in decider.asked[-1][0]
+        assert actions(game, "get_map") == []
+
+    def test_without_map_in_the_join_result_get_map_is_called_once(self):
+        game, decider = FakeGame(turns=3, state=POSITIONED, include_map_in_join=False), FakeDecider()
+        play_against(game, make_ctx()[0], decider, SequencePlayer([]))
+        assert len(actions(game, "get_map")) == 1  # once per match, not per tick
+        assert all("in your own field" in asked[0] for asked in decider.asked[-3:])
+
+    def test_without_any_map_the_match_still_plays_and_the_position_is_not_guessed(self, caplog):
+        game = FakeGame(turns=2, state=POSITIONED, include_map_in_join=False, serve_get_map=False)
+        decider = FakeDecider()
+        with caplog.at_level(logging.WARNING, logger="decider_loop"):
+            play_against(game, make_ctx()[0], decider, SequencePlayer([]))
+        assert [m["tick"] for m in actions(game, "move")] == [1, 2]
+        state = decider.asked[-1][0]
+        assert "you: red-1 (red) at (3, 7)" in state and "field" not in state
+        assert "no static map" in caplog.text
+
+    def test_the_map_is_parsed_from_the_server_shape(self):
+        info = logic.parse_map(MAP)
+        assert info.fields["red"] == (0, 6) and info.neutral_x == 7
+        assert info.flag_bases == {"red": (1, 7), "blue": (13, 7)}
+        assert GRID["width"] == 15
+
+    def test_the_server_last_action_never_reaches_the_decider_state(self):
+        game, decider = FakeGame(turns=2, state=POSITIONED), FakeDecider()
+        play_against(game, make_ctx()[0], decider, SequencePlayer([]))
+        for state, _, _ in decider.asked:
+            assert "previous action" not in state and "last action result" not in state
+
+    def test_routes_with_closest_threat_are_rendered_for_the_decider(self):
+        route = make_route("enemy_flag_direct", "enemy_flag", "left", 4, threat=("blue-1", 2, 1))
+        game, decider = (
+            FakeGame(turns=1, state={**POSITIONED, "routes": [route]}),
+            FakeDecider(pick="enemy_flag_direct"),
+        )
+        play_against(game, make_ctx()[0], decider, SequencePlayer([]))
+        assert "closest threat blue-1 at step 2, distance 1" in decider.asked[-1][0]
+        assert [m["direction"] for m in actions(game, "move")] == ["left"]
+
+
+class TestMatchOutcome:
+    def test_a_completed_match_is_logged_with_its_reason_and_winner(self, caplog):
+        with caplog.at_level(logging.INFO, logger="decider_loop"):
+            play_against(FakeGame(turns=1, state=STATE), make_ctx()[0], FakeDecider(), SequencePlayer([]))
+        assert "match over (completed): winner tie, score red 0, blue 0" in caplog.text
+
+    def test_a_stopped_match_has_no_winner_and_does_not_crash(self, caplog):
+        game = FakeGame(turns=1, state=STATE, stopped=True)
+        with caplog.at_level(logging.INFO, logger="decider_loop"):
+            play_against(game, make_ctx()[0], FakeDecider(), SequencePlayer([]))
+        assert "match over (stopped): no winner" in caplog.text
+
+    def test_a_rejected_ack_is_logged_with_its_reason_and_the_loop_keeps_playing(self, caplog):
+        game = FakeGame(turns=2, state=STATE, reject_actions="match_not_started")
+        with caplog.at_level(logging.WARNING, logger="decider_loop"):
+            play_against(game, make_ctx()[0], FakeDecider(), SequencePlayer([]))
+        assert len(actions(game, "move")) == 2
+        assert caplog.text.count("action rejected: match_not_started") == 2
 
 
 class TestJoin:
@@ -169,6 +247,15 @@ class TestFallback:
         prompt = model.calls[0][0]["content"][0]["text"]
         assert "This is tick 1" in prompt and "move, tag, grab_flag, wait" in prompt
         assert model.system_prompts[0] == logic.LLM_SYSTEM_PROMPT
+
+    def test_the_llm_prompt_carries_the_servers_last_action_the_decider_text_does_not(self):
+        game, decider = FakeGame(turns=2, state=POSITIONED), FakeDecider(confidence=0.3)
+        model = self.llm_moves(1, 2)
+        play_against(game, make_ctx(options={"llm_budget_ms": 100})[0], decider, model)
+        first, second = (call[0]["content"][0]["text"] for call in model.calls)
+        assert "previous action" not in first  # first turn: null
+        assert "outcome of your previous action: move:down at tick 1 -> moved" in second
+        assert all("previous action" not in state for state, _, _ in decider.asked)
 
     def test_a_decider_that_is_down_for_the_whole_match_leaves_every_tick_to_the_llm(self):
         game = FakeGame(turns=3, state=STATE)
@@ -255,7 +342,18 @@ def authorized_for_first(n_calls):
             if seen["calls"] > n_calls:
                 return httpx.Response(401, json={"error": "invalid_token"})
             name = body["params"]["name"]
-            if name == "wait_for_turn":
+            if name == "join_match":
+                payload = {
+                    "agent_id": "red-1",
+                    "team": "red",
+                    "agent_index": 0,
+                    "ticks": 10,
+                    "deadline_ms": 5000,
+                    "grid": GRID,
+                    "min_tick_ms": 0,
+                    "map": MAP,
+                }
+            elif name == "wait_for_turn":
                 payload = {
                     "status": "turn",
                     "tick": seen["calls"],
@@ -275,7 +373,7 @@ def authorized_for_first(n_calls):
             result = {
                 "tools": [
                     {"name": n, "description": n, "inputSchema": schema}
-                    for n in ("join_match", "wait_for_turn", "move", "tag", "grab_flag", "wait")
+                    for n in ("get_map", "join_match", "wait_for_turn", "move", "tag", "grab_flag", "wait")
                 ]
             }
         else:
