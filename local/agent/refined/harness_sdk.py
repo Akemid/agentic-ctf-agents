@@ -6,20 +6,19 @@ loop, so every tick costs a full LLM turn over the whole conversation. Changes t
 - Bounded history: `SlidingWindowConversationManager` keeps roughly the last 3 ticks and pins the
   initial instruction (`--window`).
 - Act-fast prompt: wait_for_turn, then exactly one action, no narration, no repeated get_rules.
-- `StripStaticWallsHook`: `state.walls` is static, so it is removed from `wait_for_turn` results
-  after the first successful turn (the first one keeps it).
+- No static-data stripping: since the game server's MCP turn contract v2 the turn `state` no longer
+  carries `grid`, `walls`, `fields` or `flags[].base`. The map comes from `join_match.map` / `get_map`
+  and the system prompt tells the model to call `get_map` if it loses track of it (the join result
+  leaves the sliding window after a few ticks).
 - Default `--name` is `refined-sdk`; the initial instruction is in English.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-from typing import Any
 
 from strands import Agent
 from strands.agent.conversation_manager import SlidingWindowConversationManager
-from strands.hooks import AfterToolCallEvent
 from strands.tools.mcp import MCPClient
 
 MODELS = {
@@ -44,9 +43,15 @@ SYSTEM_PROMPT = (
     "server (ids like enemy_flag_direct, enemy_flag_safe, enemy_flag_detour, own_base_*, "
     "tag:<enemy_id>, defend_flag). The server never recommends one; you choose. Weigh each "
     "route's length, blocked_now/blocked_reason, risks (cells where you can be tagged) and "
-    "min_enemy_distance, then call move with that route's first_step. A tag route with "
+    "closest_threat (the nearest enemy that can tag you along that route, as enemy_id, step and "
+    "distance in moves around walls, or null when there is none), then call move with that "
+    "route's first_step. A tag route with "
     "length 0 means the enemy is adjacent: call tag with that enemy_id. Call grab_flag when "
     "standing on the enemy flag. Call exactly one action per tick, with the current tick."
+    " The board never changes, so turns do not repeat it: join_match returns it once as `map` "
+    "(grid, walls, fields, flag_bases) and get_map returns it again at any time. If you lose "
+    "track of the layout, call get_map. Each turn also carries last_action, the outcome of your "
+    "previous action (null on your first turn); use it to notice a blocked or rejected move."
     " " + ACT_FAST_PROMPT
 )
 
@@ -73,56 +78,6 @@ def make_conversation_manager(window: int = DEFAULT_WINDOW) -> SlidingWindowConv
         per_turn=True,
         pin_first=1,
     )
-
-
-class StripStaticWallsHook:
-    """Removes the static `state.walls` list from `wait_for_turn` results after the first turn.
-
-    The map never changes during a match, so repeating it every tick only grows the context and
-    the input tokens. The first successful turn keeps it so the model sees the map once.
-    Verified in strands hooks/events.py: `AfterToolCallEvent.result` is writable, and the
-    executor uses the (possibly replaced) result. MCP tool names carry the server prefix
-    (`ctf-game_wait_for_turn`), hence the suffix match.
-    """
-
-    def __init__(self) -> None:
-        self.walls_seen = False
-
-    def register_hooks(self, registry: Any, **kwargs: Any) -> None:
-        registry.add_callback(AfterToolCallEvent, self.after_tool_call)
-
-    @staticmethod
-    def _is_wait_for_turn(name: Any) -> bool:
-        return isinstance(name, str) and (name == "wait_for_turn" or name.endswith("_wait_for_turn"))
-
-    def after_tool_call(self, event: Any) -> None:
-        if not self._is_wait_for_turn((getattr(event, "tool_use", None) or {}).get("name")):
-            return
-        result = getattr(event, "result", None)
-        if not isinstance(result, dict) or result.get("status") == "error":
-            return
-        content = result.get("content")
-        if not isinstance(content, list):
-            return
-        for index, block in enumerate(content):
-            text = block.get("text") if isinstance(block, dict) else None
-            if not isinstance(text, str):
-                continue
-            try:
-                payload = json.loads(text)
-            except json.JSONDecodeError:
-                return
-            state = payload.get("state") if isinstance(payload, dict) else None
-            if not isinstance(state, dict) or "walls" not in state:
-                return
-            if not self.walls_seen:
-                self.walls_seen = True
-                return
-            del state["walls"]
-            new_content = list(content)
-            new_content[index] = {**block, "text": json.dumps(payload)}
-            event.result = {**result, "content": new_content}
-            return
 
 
 def build_instruction(match: str, name: str) -> str:
@@ -152,7 +107,6 @@ def main() -> None:
         system_prompt=SYSTEM_PROMPT,
         tools=clients,  # MCP clients expose their discovered tools to the agent
         conversation_manager=make_conversation_manager(args.window),
-        hooks=[StripStaticWallsHook()],
     )
 
     agent(build_instruction(args.match, args.name))

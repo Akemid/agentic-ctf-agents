@@ -1,8 +1,13 @@
 """Strands hooks and conversation manager shared by the LLM-driven runtimes.
 
-`StripStaticWallsHook` and `make_conversation_manager` are extracted verbatim from
-`local/agent/refined/harness_sdk.py` (characterization-tested). `StopRequestedHook` and
-`TickCounterHook` are new: they connect the agent loop to the MatchRunner.
+`make_conversation_manager` is extracted from `local/agent/refined/harness_sdk.py` (characterization-tested).
+`StopRequestedHook`, `ConnectionLostHook` and `TickCounterHook` are new: they connect the agent loop to the
+MatchRunner.
+
+There is deliberately no hook that strips static board data from turns: since the game server's MCP turn
+contract v2 the turn `state` no longer carries `grid`, `walls`, `fields` or `flags[].base`. The static map
+comes from `join_match.map` / `get_map`; the system prompt tells the model to call `get_map` if it loses
+track of it (with `pin_first=1` and a short window the join result leaves the history after a few ticks).
 """
 
 from __future__ import annotations
@@ -58,56 +63,6 @@ def make_conversation_manager(window: int = DEFAULT_WINDOW) -> SlidingWindowConv
 
 def _is_wait_for_turn(name: Any) -> bool:
     return isinstance(name, str) and (name == "wait_for_turn" or name.endswith("_wait_for_turn"))
-
-
-class StripStaticWallsHook:
-    """Removes the static `state.walls` list from `wait_for_turn` results after the first turn.
-
-    The map never changes during a match, so repeating it every tick only grows the context and
-    the input tokens. The first successful turn keeps it so the model sees the map once.
-    Verified in strands hooks/events.py: `AfterToolCallEvent.result` is writable, and the
-    executor uses the (possibly replaced) result. MCP tool names carry the server prefix
-    (`ctf-game_wait_for_turn`), hence the suffix match.
-    """
-
-    def __init__(self) -> None:
-        self.walls_seen = False
-
-    def register_hooks(self, registry: Any, **kwargs: Any) -> None:
-        registry.add_callback(AfterToolCallEvent, self.after_tool_call)
-
-    @staticmethod
-    def _is_wait_for_turn(name: Any) -> bool:
-        return _is_wait_for_turn(name)
-
-    def after_tool_call(self, event: Any) -> None:
-        if not self._is_wait_for_turn((getattr(event, "tool_use", None) or {}).get("name")):
-            return
-        result = getattr(event, "result", None)
-        if not isinstance(result, dict) or result.get("status") == "error":
-            return
-        content = result.get("content")
-        if not isinstance(content, list):
-            return
-        for index, block in enumerate(content):
-            text = block.get("text") if isinstance(block, dict) else None
-            if not isinstance(text, str):
-                continue
-            try:
-                payload = json.loads(text)
-            except json.JSONDecodeError:
-                return
-            state = payload.get("state") if isinstance(payload, dict) else None
-            if not isinstance(state, dict) or "walls" not in state:
-                return
-            if not self.walls_seen:
-                self.walls_seen = True
-                return
-            del state["walls"]
-            new_content = list(content)
-            new_content[index] = {**block, "text": json.dumps(payload)}
-            event.result = {**result, "content": new_content}
-            return
 
 
 class StopRequestedHook:

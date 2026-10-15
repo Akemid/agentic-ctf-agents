@@ -73,7 +73,7 @@ class TestPlayLoop:
 
     def test_joins_with_the_requested_match_and_name(self):
         game, (ctx, _) = FakeGame(turns=1), make_ctx()
-        model = play_against(game, ctx, ScriptedPlayer({"match_id": "m1", "name": "p1"}))
+        model = play_against(game, ctx, ScriptedPlayer({"match_id": "m1", "name": "p1", "team": "red"}))
         first_user = model.calls[0][0]
         assert first_user["role"] == "user"
         text = first_user["content"][0]["text"]
@@ -97,7 +97,8 @@ class TestPlayLoop:
         play_against(game, ctx)
         assert len(game.actions) == 26 and tokens.calls == 1
 
-    def test_static_walls_are_stripped_after_the_first_turn(self):
+    def test_turns_reach_the_model_untouched_and_carry_no_static_board_data(self):
+        # Contract v2: the server no longer sends walls/fields/grid in turns, so nothing is rewritten.
         game, (ctx, _) = FakeGame(turns=3), make_ctx()
         model = play_against(game, ctx)
         texts = [
@@ -109,8 +110,17 @@ class TestPlayLoop:
             for part in block["toolResult"]["content"]
             if '"status": "turn"' in part["text"]
         ]
-        by_tick = {json.loads(t)["tick"]: json.loads(t)["state"] for t in texts}
-        assert "walls" in by_tick[1] and "walls" not in by_tick[2] and "walls" not in by_tick[3]
+        by_tick = {json.loads(t)["tick"]: json.loads(t) for t in texts}
+        assert set(by_tick) == {1, 2, 3}
+        for turn in by_tick.values():
+            assert {"grid", "walls", "fields"}.isdisjoint(turn["state"])
+            assert "last_action" in turn
+        assert by_tick[1]["last_action"] is None and by_tick[2]["last_action"]["action"] == "move:up"
+
+    def test_the_model_is_given_get_map_so_it_can_recover_the_static_map(self):
+        game, (ctx, _) = FakeGame(turns=1), make_ctx()
+        model = play_against(game, ctx)
+        assert "get_map" in model.system_prompts[0]
 
     def test_window_option_bounds_the_history_sent_to_the_model(self):
         game, (ctx, _) = FakeGame(turns=12), make_ctx(options={"window": 8})

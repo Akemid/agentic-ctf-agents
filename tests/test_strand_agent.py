@@ -15,7 +15,7 @@ from ctf_common.runner import MatchContext
 from fake_mcp import FakeGame, handshake_ok_then_401_on_tool_call, in_memory_transport
 from fake_model import ScriptedPlayer, SequencePlayer
 
-JOIN = ("ctf-game_join_match", {"match_id": "m1", "name": "p1"})
+JOIN = ("ctf-game_join_match", {"match_id": "m1", "team": "red", "name": "p1"})
 WAIT = ("ctf-game_wait_for_turn", {})
 
 
