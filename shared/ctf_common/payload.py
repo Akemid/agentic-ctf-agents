@@ -79,6 +79,13 @@ class MatchRequest:
     options: Mapping[str, int | float] = field(default_factory=dict)
 
 
+def require_match_id(request: MatchRequest) -> str:
+    """The match id of a request that is about to play. `start` always carries one (validated at parse)."""
+    if request.match_id is None:
+        raise PayloadError("match_id is required to play a match")
+    return request.match_id
+
+
 def sanitize_name(raw: str) -> str:
     """Lowercase, replace anything outside [a-z0-9_-] with '-', cap at 32 chars."""
     return _NAME_INVALID_RE.sub("-", raw.lower())[:NAME_MAX_LEN]

@@ -12,7 +12,10 @@ Code shared by the four CTF agent runtimes. This directory is the **source of tr
 | `auth.py` | `TokenProvider` implementations. One `get_token()` call is one AgentCore Identity fetch (no cache). |
 | `mcp.py` | `open_mcp_client`: fetches the token when a connection opens. `raise_on_auth_failure` maps 401 to an error. |
 | `prompts.py` | System prompt, instruction builder, model aliases. |
-| `hooks.py` | Strands hooks (static-wall stripping, stop request, tick counter) and the sliding-window manager. |
+| `hooks.py` | Strands hooks (static-wall stripping, stop request, lost connection, tick counter) and the sliding-window manager. |
+| `decider.py` | Question builders, `CircuitBreaker`, `SageMakerDecider` (AgentCore) and `HttpDecider` (local) behind one guard: deadline clamp, one retry, breaker. Every failure is a `ServerUnavailable`. |
+| `wiring.py` | `build_runner`: preflight (SSM config + one token) shared by every runtime. No AWS call until `start`. |
+| `strands_match.py` | `play_strands_match`: the Strands `Agent` match loop used by `harness_sdk` and `strand_decider`. |
 
 ## Rules
 

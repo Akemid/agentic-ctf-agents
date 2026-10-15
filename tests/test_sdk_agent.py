@@ -16,7 +16,7 @@ from ctf_common.mcp import McpAuthError, open_mcp_client
 from ctf_common.payload import Action, MatchRequest
 from ctf_common.prompts import SYSTEM_PROMPT
 from ctf_common.runner import MatchContext
-from fake_mcp import FakeGame, in_memory_transport
+from fake_mcp import FakeGame, handshake_ok_then_401_on_tool_call, in_memory_transport
 from fake_model import ScriptedPlayer
 
 APP_DIR = Path(__file__).resolve().parents[1] / "app" / "harness_sdk"
@@ -145,28 +145,6 @@ class TestPlayLoop:
         with pytest.raises(McpAuthError):
             sdk_agent.play(ctx, mcp_factory=mcp_factory, model=ScriptedPlayer())
         assert tokens.calls == 1
-
-
-def handshake_ok_then_401_on_tool_call(request: httpx.Request) -> httpx.Response:
-    """A minimal MCP server over plain JSON: initialize and tools/list succeed, tools/call is 401."""
-    body = json.loads(request.content or b"{}")
-    method, rpc_id = body.get("method"), body.get("id")
-    if method == "tools/call":
-        return httpx.Response(401, json={"error": "invalid_token"})
-    if rpc_id is None:  # notifications (initialized, ...)
-        return httpx.Response(202)
-    if method == "initialize":
-        result = {
-            "protocolVersion": body["params"]["protocolVersion"],
-            "capabilities": {"tools": {}},
-            "serverInfo": {"name": "ctf-game", "version": "0"},
-        }
-    elif method == "tools/list":
-        schema = {"type": "object", "properties": {}}
-        result = {"tools": [{"name": "join_match", "description": "Join.", "inputSchema": schema}]}
-    else:
-        result = {}
-    return httpx.Response(200, json={"jsonrpc": "2.0", "id": rpc_id, "result": result})
 
 
 class TestMidMatchUnauthorized:

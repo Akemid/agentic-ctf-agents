@@ -72,3 +72,19 @@ class ScriptedPlayer(Model):
                 "metrics": {"latencyMs": 1},
             }
         }
+
+
+class SequencePlayer(ScriptedPlayer):
+    """Plays a fixed list of (tool name, arguments) calls whatever the tool results say, then a final text."""
+
+    def __init__(self, script: list[tuple[str, dict[str, Any]]]) -> None:
+        super().__init__()
+        self.script = list(script)
+        self._i = 0
+
+    def _decide(self, messages: list[dict]) -> tuple[str, dict[str, Any]] | str:
+        if self._i >= len(self.script):
+            return "done"
+        decision = self.script[self._i]
+        self._i += 1
+        return decision
