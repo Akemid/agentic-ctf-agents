@@ -243,3 +243,66 @@ Mode: Strict TDD. Branch `feat/agentcore-ctf-fleet-slice3` (uncommitted). No AWS
 
 ### Files changed in this round
 `infra/decider/lib/{app,decider-stack,persistent-stack}.ts`, `infra/decider/test/{app,decider-stack,persistent-stack}.test.ts`, `infra/decider/{Makefile,README.md,cdk.json}`, `infra/decider/adapter/{Dockerfile,Dockerfile.local}`, `infra/decider/adapter/adapter/{app,config,runtime,stage,supervisor,warmup}.py`, `infra/decider/scripts/build_image.sh`, `tests/test_adapter_{app,build,e2e,supervisor,support}.py`, `design.md`, `tasks.md`, `apply-progress.md`.
+
+
+## Batch PR4 (Phase 4, Slice 4), branch feat/agentcore-ctf-fleet-slice4, UNCOMMITTED, Strict TDD
+Tasks: [x] 4.1 4.2 4.3 4.4 4.5 4.7. [~] 4.6 PREPARED (docs/e2e-acceptance.md), awaits user with a real account (needs 0.1, the game stack and the GPU endpoint). No AWS-mutating command, no deploy, no invoke, no create. Read-only `agentcore validate` (Valid) and `cdk synth -o <scratch>` were run.
+
+### TDD Cycle Evidence
+| Task | Test file | Layer | Safety net | RED | GREEN | Triangulate | Refactor |
+|------|-----------|-------|------------|-----|-----|-------------|----------|
+| 4.1 | tests/test_fleet_config.py | Unit + contract | N/A (new) | ModuleNotFoundError fleet_config, then 6 hygiene failures for missing files | 22 passed once docs and TS existed | 4 runtimes parametrised, placeholder/real URL, naming rules | ruff format |
+| 4.2 | agentcore/cdk/test/fleet-wiring.test.ts | Unit (recording fakes) | jest 1/1 | TS compile errors (module missing) | 33 passed (incl. cdk.test) | per-runtime env/IAM, decider-only grants, missing/unknown/duplicate, partition/endpoint override, adaptEnvironments fake app | prettier |
+| 4.3 | tests/test_hydrate.py | Unit (botocore Stubber) | N/A (new) | ModuleNotFoundError, then 28 failing | 32 passed | happy path, 8 failure modes, drift, clean, check, CLI, real-file byte round trip | ruff |
+| 4.4 | tests/test_fleet_cli.py | Unit (Stubber) + contract with ctf_common.payload | N/A (new) | ModuleNotFoundError | 46 passed | caps, teams, session ids, dry-run, partial failure, status, stop, hard stop, ARN sources | build_payload takes match from Character |
+| 4.5 | tests/test_fleet_config.py (hygiene over docs) | Contract | N/A | docs missing -> failing | passing | n/a | - |
+
+### Results
+- pytest 1304 passed (1202 before; +102). agentcore/cdk jest 33 passed (1 before). infra/decider jest 49 passed. `agentcore validate` Valid. `sync_common.py --check` in sync. ruff check and format clean on the new files.
+- `cdk synth` (scratch output dir): OK on a fresh checkout without `deployed-state.json`. Template: 4 runtimes with lifecycle 900/14400 and the CTF_* variables; SSM and (decider only) SageMaker statements; L3 Identity grants and Bedrock InvokeModel present; no Fn::ImportValue. 12 L3 stack outputs carry `Export` (L3, not ours).
+- A stack-level jest test over the real agentcore.json took 115 s (asset bundling), so it was not kept.
+
+### Files (G = generated)
+New: agentcore/cdk/lib/fleet-wiring.ts, agentcore/cdk/test/fleet-wiring.test.ts, scripts/{fleet_config,hydrate_credentials,fleet}.py, tests/test_{fleet_config,hydrate,fleet_cli}.py, docs/workshop-runbook.md, docs/e2e-acceptance.md. Modified: agentcore/agentcore.json (4 runtimes, 4 credentials; formatting rewritten by json.dump with indent 2), agentcore/cdk/lib/cdk-stack.ts, design.md, tasks.md, apply-progress.md. Outside the repo: blog-notes D36-D39.
+
+### Deviations
+- `cdk-stack.ts` hook is 8 lines, not 2 (prettier width, plus an `environments.size > 0` guard because the existing empty-spec test has no runtimes).
+- Launcher is `scripts/fleet.py` (design name), added `--teams`, `--runtime-arn`, state file `.fleet/<match>.json`.
+- `--check` mode added to hydrate; placeholder treated as unset.
+- No `credentials` prop on wireFleet (L3 already grants Identity).
+### Open
+- Spec scenario "no Export in the synthesized AgentCore template" cannot hold: the L3 exports its outputs.
+- Deploy after `hydrate --clean` without re-hydrating would send the placeholder to Identity; runbook warns, `--check` guards.
+- `CTF_RUNTIME_NAME` is unread by Python.
+- 4.6 needs the user (real account); token validity (1 h vs 4 h) must be verified first.
+
+
+## Slice 4 review fixes (judgment-day round 3), UNCOMMITTED, Strict TDD
+No task status changed (4.8 added, done). No AWS-mutating command was run.
+
+### TDD evidence (RED then GREEN)
+| Fix | Test | RED | GREEN |
+|---|---|---|---|
+| 1 launcher never revives ended sessions | `tests/test_fleet_cli.py` `TestSessionLiveness` (fake `Clock`, Stubber, `rig.invoked` counter on InvokeAgentRuntime) | `TypeError: main() got an unexpected keyword argument 'clock'`; after the clock existed, 3 failures (dry run created the lock dir; a `failed` reply was not stamped as an answer) | 82 passed in the file |
+| 2 deploy wrapper | `tests/test_deploy_wrapper.py` (fake `uv` and `agentcore` first on PATH) | `FileNotFoundError scripts/deploy_fleet.sh` | 16 passed (order, `--clean` on failure, no deploy when `--check` fails, SIGINT/SIGTERM, `make -n`, dry run without YES) |
+| 3 narrow SSM grant | `fleet-wiring.test.ts` | 3 failed (received `/ctf-decider/*`) | 34 passed |
+| 5 state file | `TestStateSafety` | part of the run above (path validation, corrupt JSON, lock, cap) | passed |
+| 6a env name contract | `tests/test_env_contract.py` | mutation check: renaming `CTF_OAUTH_SCOPES` to `CTF_OAUTH_SCOPE` in the TS fails two tests | 6 passed |
+| 6b real stack test | `agentcore/cdk/test/fleet-stack.test.ts` | TS2305 (packager not exported), fixed by loading it by file path | 6 tests, about 10 s |
+| 8 hydrate | `TestPairedWrites`, `TestFileModes` | 4 failed (order; mode 0600/0640/0664 forced to 0644) | 40 passed in the file |
+| 7 guard `(spec.runtimes?.length ?? 0) > 0` | covered by `fleet-stack.test.ts` and `cdk.test.ts` | no RED possible: both guards behave the same on every spec that the real L3 can build | passing |
+| commit-split enabler | `tests/test_fleet_config.py` `PUBLIC_FILES` by glob + non-empty guard | n/a (refactor of a test) | passing |
+
+### Results
+- pytest 1378 passed (1304 before; +74). agentcore/cdk jest 41 passed (33 before; +8). infra/decider jest 49. `agentcore validate` Valid. `sync_common.py --check` in sync. `ruff check .` clean, `shellcheck scripts/deploy_fleet.sh` clean, prettier clean on the TS files.
+- Real stack test: the L3 code packager (uv and pip, about 115 s) is not CDK bundling and no context (`aws:cdk-lib:bundling-stacks`, `bundlingStacks`) skips it, so the test stubs `PythonBundledCodeZipAsset.prototype.packageCode` (loaded by file path because the package `exports` map hides it). It then runs in about 10 s, so it is kept. The unstubbed manual synth check (`cdk synth -o <scratch>`) remains useful before a release.
+
+### Files
+New: Makefile, scripts/deploy_fleet.sh, agentcore/cdk/test/fleet-stack.test.ts, tests/test_deploy_wrapper.py, tests/test_env_contract.py. Modified: scripts/fleet.py, scripts/fleet_config.py (`MAX_LIFETIME_SECONDS`), scripts/hydrate_credentials.py, agentcore/cdk/lib/fleet-wiring.ts, agentcore/cdk/lib/cdk-stack.ts, agentcore/cdk/test/fleet-wiring.test.ts, tests/test_fleet_cli.py, tests/test_fleet_config.py, tests/test_hydrate.py, docs/workshop-runbook.md, docs/e2e-acceptance.md, openspec specs fleet-operations and ctf-agent-runtimes, design.md, tasks.md, this file. Outside the repo: blog-notes D40.
+
+### Deviations and notes
+- The wrapper runs `agentcore deploy --yes` (non-interactive; YES=1 is the consent). `UPDATE_DISCOVERY_URL=1` passes `--update-discovery-url` to the hydrate step.
+- `deciderParamPrefix` and `DEFAULT_DECIDER_PARAM_PREFIX` were removed from fleet-wiring (the grant is one parameter now).
+- `agentcore remove credential --name <name> [--yes]` is the exact removal syntax (checked with `--help`).
+- The "no Export" spec scenario is amended (the alpha L3 exports its outputs) and the missing-SSM scenario now places the failure in the runtime preflight, not in wiring.
+- Credential isolation between runtimes is by convention only (the L3 grants `GetResourceOauth2Token` on `token-vault/*` to every runtime role): design addendum.

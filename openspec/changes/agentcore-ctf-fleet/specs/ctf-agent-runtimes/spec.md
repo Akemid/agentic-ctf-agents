@@ -14,7 +14,7 @@
 - GIVEN the deployed stack
 - WHEN IAM is inspected
 - THEN each runtime has its own role and only `strand_decider` and `decider_loop` can call `sagemaker:InvokeEndpoint`, restricted to the decider endpoint ARN
-- AND every runtime role can read only SSM parameter `/agentic-ctf/mcp-url`, and only `strand_decider` and `decider_loop` can additionally read `/ctf-decider/*`
+- AND every runtime role can read only SSM parameter `/agentic-ctf/mcp-url`, and only `strand_decider` and `decider_loop` can additionally read exactly `/ctf-decider/endpoint-name`
 
 ### Requirement: Runtime lifecycle configuration
 All four runtimes MUST set `lifecycleConfiguration` with `idleRuntimeSessionTimeout` 900 seconds and `maxLifetime` 14400 seconds.

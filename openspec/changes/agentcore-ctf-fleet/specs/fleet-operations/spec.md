@@ -3,22 +3,30 @@
 ## ADDED Requirements
 
 ### Requirement: Cross-stack values only via SSM
-The AgentCore stack, scripts and runtimes MUST obtain cross-stack values (MCP URL, Cognito URLs, client ids, secret ARNs, decider endpoint name) only from SSM Parameter Store. No CloudFormation exports or `Fn::ImportValue` MAY be introduced (D4). Values from SSM that `agentcore.json` cannot hold MUST be injected by CDK in `agentcore/cdk/lib/fleet-wiring.ts`.
+The AgentCore stack, scripts and runtimes MUST obtain cross-stack values (MCP URL, Cognito URLs, client ids, secret ARNs, decider endpoint name) only from SSM Parameter Store. This project MUST author no CloudFormation exports and MUST NOT use `Fn::ImportValue` (D4). The alpha L3 construct emits its own stack outputs with `Export` (runtime id, runtime ARN, role ARN per agent); those are not authored here and are accepted. Values from SSM that `agentcore.json` cannot hold MUST be injected by CDK in `agentcore/cdk/lib/fleet-wiring.ts`.
 
-#### Scenario: No imports
+#### Scenario: No imports and no exports of our own
 - GIVEN the synthesized AgentCore and Decider templates
 - WHEN scanned
-- THEN no `Fn::ImportValue` and no `Export` exist
+- THEN no `Fn::ImportValue` exists
+- AND the Decider template has no `Export`
+- AND the only `Export`s in the AgentCore template are the alpha L3's (`<stack>-<agent>-RuntimeId|RuntimeArn|RoleArn`)
+- AND no template parameter of type `AWS::SSM::Parameter::Value` exists (other than the CDK bootstrap version)
 
 #### Scenario: Env injection
 - GIVEN SSM values present
 - WHEN `agentcore deploy` synthesizes
 - THEN each runtime receives the needed env vars and IAM grants from fleet-wiring
 
-#### Scenario: Missing SSM value
-- GIVEN a required parameter missing
-- WHEN wiring runs
-- THEN it fails with the parameter name
+#### Scenario: Wiring never reads SSM
+- GIVEN any SSM parameter missing or present
+- WHEN `agentcore deploy` synthesizes
+- THEN wiring only sets parameter NAMES in the environment and never reads or fails on a value
+
+#### Scenario: Missing SSM value at match start
+- GIVEN a required parameter missing when a match starts
+- WHEN the runtime preflight runs
+- THEN `start` is rejected and the error names the parameter
 
 ### Requirement: Secret hydration
 A script MUST write gitignored `agentcore/.env.local` from SSM client ids and Secrets Manager secrets before `agentcore deploy` (interim path A). It MUST NOT print secrets and MUST fail if any of the four agents lacks a client id or secret.
@@ -81,4 +89,4 @@ Operations in this change MUST NOT mutate agentic-ctf resources; SSM access is r
 #### Scenario: IAM
 - GIVEN runtime roles
 - WHEN inspected
-- THEN SSM permissions are read-only (`GetParameter`): `/agentic-ctf/mcp-url` for every runtime, plus `/ctf-decider/*` for `strand_decider` and `decider_loop` only
+- THEN SSM permissions are read-only (`GetParameter`): `/agentic-ctf/mcp-url` for every runtime, plus exactly `/ctf-decider/endpoint-name` (no wildcard) for `strand_decider` and `decider_loop` only

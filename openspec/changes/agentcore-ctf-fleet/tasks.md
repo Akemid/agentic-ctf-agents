@@ -84,13 +84,14 @@ Legend adds `[ ]` for 2.9 only: deferred to a follow-up PR (see apply-progress).
 
 ## Phase 4: Slice 4 - agentcore wiring, scripts, runbook, E2E (PR 4)
 
-- [ ] 4.1 `agentcore/agentcore.json`: 4 runtimes (CodeZip, runtime version per S2, lifecycle 900/14400) + 4 credentials (Path A) or `lib/ctf-credentials.ts` (Path B per S3). `agentcore validate`.
-- [ ] 4.2 RED `agentcore/cdk/test/fleet-wiring.test.ts` (fake RuntimeEnvLike: env vars, per-runtime IAM, decider-only SSM/InvokeEndpoint, throws on missing/unknown, no agents/* secrets); GREEN `lib/fleet-wiring.ts`, 2-line call in `cdk-stack.ts`. Run `cd agentcore/cdk && npx jest`.
-- [ ] 4.3 RED/GREEN `tests/test_hydrate.py` + `scripts/hydrate_credentials.py` (0600, `--clean`, discoveryUrl drift fails).
-- [ ] 4.4 RED/GREEN `tests/test_fleet_cli.py` + `scripts/fleet.py` (start/status/stop[--hard]; limits 3/type, 2 teams, rejected before invoke; session id >= 33 chars).
-- [ ] 4.5 `docs/workshop-runbook.md`: deploy order, teardown, Budget, cost warning.
-- [ ] 4.6 E2E acceptance (manual): deploy per runbook, play a real match with all 4 types, verify tokens = MCP connections, teardown, `list-endpoints` empty.
-- [ ] 4.7 Blog-notes append (path above).
+- [x] 4.1 `agentcore/agentcore.json`: 4 runtimes (CodeZip, PYTHON_3_14, lifecycle 900/14400) + 4 outbound OAuth credentials (Path A, `ctf_<runtime>`, placeholder `discoveryUrl` hydrated locally). `agentcore validate` = Valid. Single naming table `scripts/fleet_config.py`; tests `tests/test_fleet_config.py`.
+- [x] 4.2 RED `agentcore/cdk/test/fleet-wiring.test.ts` (fake RuntimeEnvLike: env vars, per-runtime IAM, decider-only SSM/InvokeEndpoint, throws on missing/unknown, no agents/* secrets); GREEN `lib/fleet-wiring.ts`, 2-line call in `cdk-stack.ts`. Run `cd agentcore/cdk && npx jest`.
+- [x] 4.3 RED/GREEN `tests/test_hydrate.py` + `scripts/hydrate_credentials.py` (0600, `--clean`, `--check`, discoveryUrl drift fails, placeholder restored by `--clean`).
+- [x] 4.4 RED/GREEN `tests/test_fleet_cli.py` + `scripts/fleet.py` (start/status/stop[--hard]; limits 3/type, 2 teams, rejected before invoke; session id >= 33 chars).
+- [x] 4.5 `docs/workshop-runbook.md`: deploy order, teardown, Budget, cost warning (+ `docs/e2e-acceptance.md`).
+- [~] 4.6 (PREPARED in `docs/e2e-acceptance.md`; awaits user, needs a real account) E2E acceptance (manual): deploy per runbook, play a real match with all 4 types, verify tokens = MCP connections, teardown, `list-endpoints` empty.
+- [x] 4.7 Blog-notes append (path above).
+- [x] 4.8 Slice 4 review fixes (judgment-day round 3), RED then GREEN: launcher never revives ended sessions (`last_status`/`last_seen`/`started_at`, `ended (not queried)`, `--wake`, `StopRuntimeSession` for ended sessions); state lock, cap ignores stopped sessions, `--match` validation, corrupt-state errors; safe deploy wrapper `scripts/deploy_fleet.sh` + `Makefile` (`make deploy YES=1`) with `--clean` in an EXIT trap; hydrate writes `agentcore.json` first and keeps its mode; decider SSM grant narrowed to `/ctf-decider/endpoint-name`; `(spec.runtimes?.length ?? 0) > 0` guard; env-name contract test (TS vs Python); real `AgentCoreStack` jest test (about 10 s, packager stubbed); spec, design and runbook amendments; `PUBLIC_FILES` built by glob.
 
 > Review fixes (judgment-day round 1) applied to Phase 1 code: see `apply-progress.md` "Review fixes". No task status changed.
 

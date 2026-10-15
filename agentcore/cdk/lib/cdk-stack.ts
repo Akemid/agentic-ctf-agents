@@ -11,6 +11,7 @@ import {
 import { CfnOutput, Stack, type StackProps } from 'aws-cdk-lib';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import { Construct } from 'constructs';
+import { adaptEnvironments, wireFleet } from './fleet-wiring';
 
 /**
  * Harness deployment config: role-scoped fields (for IAM role + container build)
@@ -124,6 +125,16 @@ export class AgentCoreStack extends Stack {
       appProps.credentials = credentials;
     }
     this.application = new AgentCoreApplication(this, 'Application', appProps as any);
+
+    // Fleet env vars and least-privilege IAM (SSM, decider endpoint). Guard on the SPEC, not on the
+    // constructed environments: a spec with runtimes must be wired (or fail loudly), never skipped.
+    if ((spec.runtimes?.length ?? 0) > 0) {
+      wireFleet(adaptEnvironments(this.application), {
+        account: this.account,
+        region: this.region,
+        partition: this.partition,
+      });
+    }
 
     // Create AgentCoreMcp if there are gateways configured
     if (mcpSpec?.agentCoreGateways && mcpSpec.agentCoreGateways.length > 0) {
