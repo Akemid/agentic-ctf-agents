@@ -72,14 +72,15 @@ Legend adds `[ ]` for 2.9 only: deferred to a follow-up PR (see apply-progress).
 
 ## Phase 3: Slice 3 - infra/decider (PR 3)
 
-- [ ] 3.1 Scaffold `infra/decider/` (package.json, jest config, `bin/decider.ts`).
-- [ ] 3.2 RED `test/persistent-stack.test.ts` (ECR keep-3 RETAIN, Budget $25 80%/100%, SNS email); GREEN `lib/persistent-stack.ts`.
-- [ ] 3.3 RED `test/decider-stack.test.ts` (g4dn.xlarge x1, fixed EndpointName only, generated Model/Config names, startup timeout, SSM `/ctf-decider/endpoint-name`, no Export, no Budget); GREEN `lib/decider-stack.ts`.
-- [ ] 3.4 RED adapter tests (TestClient + MockTransport: passthrough + queue_wait_ms, concurrency 1, queue_full at 8, 2 s wait -> 503, /ping unblocked, 503 until warm); GREEN `adapter/adapter/app.py`, `warmup.py`.
-- [ ] 3.5 RED/GREEN supervisor tests (restart once, then permanent 503); `supervisor.py`, `__main__.py`.
-- [ ] 3.6 `adapter/Dockerfile` (digest-pinned, amd64, HF_HUB_OFFLINE) and `scripts/decider_image.sh` (content-hash tag, CodeBuild fallback note).
-- [ ] 3.7 Verify: `cd infra/decider && npx jest`, `cdk synth`. Manual: deploy, InService, ping, teardown (needs 0.1).
-- [ ] 3.8 Blog-notes append (path above).
+- [x] 3.1 Scaffold `infra/decider/` (package.json, jest config, `bin/decider.ts`).
+- [x] 3.2 RED `test/persistent-stack.test.ts` (ECR keep-3 RETAIN, Budget $25 80%/100%, SNS email); GREEN `lib/persistent-stack.ts`.
+- [x] 3.3 RED `test/decider-stack.test.ts` (g4dn.xlarge x1, fixed EndpointName only, generated Model/Config names, startup timeout, SSM `/ctf-decider/endpoint-name`, no Export, no Budget); GREEN `lib/decider-stack.ts`.
+- [x] 3.4 RED adapter tests (TestClient + MockTransport: passthrough + queue_wait_ms, concurrency 1, queue_full at 8, 2 s wait -> 503, /ping unblocked, 503 until warm); GREEN `adapter/adapter/app.py`, `warmup.py`.
+- [x] 3.5 RED/GREEN supervisor tests (restart once, then permanent 503); `supervisor.py`, `__main__.py`.
+- [x] 3.6 `adapter/Dockerfile` (digest-pinned, amd64, HF_HUB_OFFLINE) and `scripts/build_image.sh` (CodeBuild, content-hash tag, `--yes` required), `Dockerfile.local` + `scripts/smoke_local.sh`.
+- [~] 3.7 Verify: `cd infra/decider && npx jest`, `cdk synth`. Automated part DONE (jest 49, pytest 1202, synth of both stacks, local Docker smoke). Manual part awaiting user (needs 0.1): deploy, InService, ping, teardown.
+- [x] 3.8 Blog-notes append (path above).
+- [x] 3.9 Slice 3 judgment-day fixes (13 items): always-synthesized stacks with deploy-blocking error annotations (destroy needs no inputs) and Makefile `deploy-persistent` / `deploy-decider` / `destroy-decider`; adapter drain after upstream timeout, probe skipping while busy, spawn-failure FAILED state, disconnect and NaN handling, threaded staging, exposed knobs; AWS DLC base image (no Docker Hub); IAM metrics and confused-deputy conditions; build script ECR error handling and single model-id source; buildspec push guard; hash parity test. See apply-progress and the design addendum.
 
 ## Phase 4: Slice 4 - agentcore wiring, scripts, runbook, E2E (PR 4)
 
