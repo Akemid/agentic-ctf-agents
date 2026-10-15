@@ -60,13 +60,15 @@ Sources to port from now live in this repo: `local/agent/refined/` and `local/ag
 
 ## Phase 2: Slice 2 - remaining ports, decider client (PR 2)
 
-- [ ] 2.1 RED `tests/test_decider_client.py` (Stubber + injected clock: each error-map row, clamp, 1 retry, breaker 3/30 s/half-open, misconfig 300 s). 2.2 GREEN `decider.py` (builders, DeciderPort, SageMakerDecider, CircuitBreaker). Gated by 0.7 for timeouts.
-- [ ] 2.3 Port `app/harness/` (`harness/harness_agent.py`); branch per S1 result (headers / prebuilt MCPClient / descope + report). Play-loop test with fake MCP.
-- [ ] 2.4 Characterization tests then port `app/decider_loop/loop.py` pure functions; RED/GREEN loop test with fake decider (breaker fallback to LLM, StopEvent per tick).
-- [ ] 2.5 Port `app/strand_decider/gate.py` (remove fcntl lock); test gate with fake decider.
-- [ ] 2.6 Re-run `sync_common.py`; `--check` green. 2.7 Verify: pytest green, no torch in any pyproject.
-- [ ] 2.8 Blog-notes append (path above).
-- [ ] 2.9 Follow-up (own PR if it exceeds budget): make `local/agent/refined/` consume `shared/ctf_common` (prompts, hooks, payload/option parsing, decider question builders) instead of its own copies, so the original and the deployed ports cannot drift. Keep `cd local && python -m unittest discover -s tests` green and add a guard test that fails if `local/` re-defines a shared symbol. Do not change local CLI behavior.
+Legend adds `[ ]` for 2.9 only: deferred to a follow-up PR (see apply-progress).
+
+- [x] 2.1 RED `tests/test_decider_client.py` (Stubber + injected clock: each error-map row, clamp, 1 retry, breaker 3/30 s/half-open, misconfig 300 s). [x] 2.2 GREEN `shared/ctf_common/decider.py` (builders, DeciderPort, SageMakerDecider, HttpDecider, CircuitBreaker). Gated by 0.7 for timeouts: design defaults used (2.5 s read ceiling, 3 failures, 30 s).
+- [x] 2.3 Port `app/harness/` (`harness_agent.py`); S1 branch `mcp_servers={"ctf-game": {url, headers, continue_on_error: false}}`. Play-loop test with fake MCP plus a real-HTTP mid-match 401 test.
+- [x] 2.4 Characterization tests (586 cases, differential vs the local original) then port `app/decider_loop/{loop_logic,loop}.py`; RED/GREEN loop test with fake decider (breaker fallback to LLM, stop per tick, dead connection fails the match).
+- [x] 2.5 Port `app/strand_decider/{gate,strand_agent}.py` (fcntl lock removed); gate tests with fake decider plus end-to-end block/proceed/fail-open.
+- [x] 2.6 Re-run `sync_common.py`; `--check` green. [x] 2.7 Verify: pytest green, no torch in any pyproject (`tests/test_runtime_deps.py`, CodeZip simulation: 57/42/42/43 MB zipped).
+- [x] 2.8 Blog-notes append (path above): D22-D28.
+- [ ] 2.9 Follow-up (own PR if it exceeds budget): make `local/agent/refined/` consume `shared/ctf_common` (prompts, hooks, payload/option parsing, decider question builders) instead of its own copies, so the original and the deployed ports cannot drift. Keep `cd local && python -m unittest discover -s tests` green and add a guard test that fails if `local/` re-defines a shared symbol. Do not change local CLI behavior. DEFERRED from slice 2: `local/` is a git subtree with `requires-python >=3.10` while `ctf_common` needs 3.11+ (`StrEnum`, `datetime.UTC`); slice 2 added differential tests (ports vs the local originals) that already fail on drift on either side.
 
 ## Phase 3: Slice 3 - infra/decider (PR 3)
 
@@ -90,3 +92,5 @@ Sources to port from now live in this repo: `local/agent/refined/` and `local/ag
 - [ ] 4.7 Blog-notes append (path above).
 
 > Review fixes (judgment-day round 1) applied to Phase 1 code: see `apply-progress.md` "Review fixes". No task status changed.
+
+> Slice 2 review fixes (judgment-day round 2): probe ownership + breaker epoch, malformed-answer fail-open in the strand gate, 0.5 s read-timeout buckets, connect timeout clamp, JSON-safe state, lazy SSM factory, `require_match_id`. See `apply-progress.md` "Slice 2 review fixes". No task status changed.

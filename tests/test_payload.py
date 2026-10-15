@@ -5,7 +5,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from ctf_common.payload import Action, MatchRequest, PayloadError, parse_payload
+from ctf_common.payload import Action, MatchRequest, PayloadError, parse_payload, require_match_id
 
 SESSION = "sess-0123456789-abcdef-0123456789-xyz123"  # last 6 chars: xyz123
 
@@ -230,3 +230,13 @@ def test_match_request_is_immutable():
     req = parse({"match_id": "m1"})
     with pytest.raises(FrozenInstanceError):
         req.match_id = "other"  # type: ignore[misc]
+
+
+class TestRequireMatchId:
+    def test_returns_the_id_of_a_start_request(self):
+        assert require_match_id(parse({"match_id": "m1"})) == "m1"
+
+    def test_a_request_without_an_id_fails_with_a_clear_message(self):
+        request = MatchRequest(action=Action.STOP, match_id=None, name="n", team="auto", model="haiku")
+        with pytest.raises(PayloadError, match="match_id is required"):
+            require_match_id(request)

@@ -33,6 +33,20 @@ _CONNECTION_LOST_MARKERS = (
 )
 
 
+def is_connection_lost(result: Any) -> bool:
+    """True for an error tool result that says the MCP connection is dead (pure).
+
+    Strands does not raise when the connection drops mid-match: it returns an error tool result.
+    """
+    if not isinstance(result, dict) or result.get("status") != "error":
+        return False
+    for block in result.get("content") or []:
+        text = block.get("text") if isinstance(block, dict) else None
+        if isinstance(text, str) and any(marker in text for marker in _CONNECTION_LOST_MARKERS):
+            return True
+    return False
+
+
 def make_conversation_manager(window: int = DEFAULT_WINDOW) -> SlidingWindowConversationManager:
     return SlidingWindowConversationManager(
         window_size=window,
@@ -137,14 +151,8 @@ class ConnectionLostHook:
         registry.add_callback(AfterToolsEvent, self.after_tools)
 
     def after_tool_call(self, event: Any) -> None:
-        result = getattr(event, "result", None)
-        if not isinstance(result, dict) or result.get("status") != "error":
-            return
-        for block in result.get("content") or []:
-            text = block.get("text") if isinstance(block, dict) else None
-            if isinstance(text, str) and any(marker in text for marker in _CONNECTION_LOST_MARKERS):
-                self.lost = True
-                return
+        if is_connection_lost(getattr(event, "result", None)):
+            self.lost = True
 
     def after_tools(self, event: Any) -> None:
         if self.lost:

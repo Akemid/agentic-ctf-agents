@@ -288,3 +288,31 @@ class TestConnectionLostHook:
         registry = SimpleNamespace(add_callback=lambda event_type, cb: registered.append(event_type))
         hooks.ConnectionLostHook().register_hooks(registry)
         assert {e.__name__ for e in registered} == {"AfterToolCallEvent", "AfterToolsEvent"}
+
+
+class TestIsConnectionLost:
+    @staticmethod
+    def error(text, status="error"):
+        return {"status": status, "toolUseId": "t", "content": [{"text": text}]}
+
+    @pytest.mark.parametrize(
+        "text",
+        ["Connection to the MCP server was closed", "boom: the client session is not running (x)"],
+    )
+    def test_error_results_with_a_known_marker_are_a_lost_connection(self, text):
+        assert hooks.is_connection_lost(self.error(text)) is True
+
+    def test_an_ordinary_tool_error_is_not_a_lost_connection(self):
+        assert hooks.is_connection_lost(self.error("tick already acted")) is False
+
+    def test_a_successful_result_quoting_the_marker_is_not_a_lost_connection(self):
+        assert (
+            hooks.is_connection_lost(self.error("Connection to the MCP server was closed", "success"))
+            is False
+        )
+
+    @pytest.mark.parametrize(
+        "result", [None, "text", {"status": "error"}, {"status": "error", "content": [1]}]
+    )
+    def test_malformed_results_are_not_a_lost_connection(self, result):
+        assert hooks.is_connection_lost(result) is False

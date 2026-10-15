@@ -285,3 +285,29 @@ class TestDefaultHttpClientFactory:
 
         default = inspect.signature(open_mcp_client).parameters["client_factory"].default
         assert default is mcp.default_http_client
+
+
+class TestToolPrefix:
+    """The code-owned loop calls and filters tools by their raw MCP names."""
+
+    @staticmethod
+    def tool_names(**kwargs):
+        game = FakeGame(turns=1)
+        client = open_mcp_client(
+            "https://mcp.example/mcp",
+            CountingTokens(),
+            connect=lambda url, headers: in_memory_transport(game.server),
+            **kwargs,
+        )
+        with client:
+            return sorted(tool.tool_name for tool in client.list_tools_sync())
+
+    def test_tools_are_prefixed_with_the_server_name_by_default(self):
+        names = self.tool_names()
+        assert names and all(name.startswith("ctf-game_") for name in names)
+        assert "ctf-game_wait_for_turn" in names
+
+    def test_prefixing_can_be_turned_off(self):
+        names = self.tool_names(prefix_tools=False)
+        assert {"join_match", "move", "wait_for_turn"} <= set(names)
+        assert not any(name.startswith("ctf-game_") for name in names)

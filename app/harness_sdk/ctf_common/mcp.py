@@ -61,12 +61,15 @@ def open_mcp_client(
     tokens: TokenProvider,
     *,
     server_name: str = DEFAULT_SERVER_NAME,
+    prefix_tools: bool = True,
     connect: Connect | None = None,
     client_factory: ClientFactory = default_http_client,
 ) -> MCPClient:
     """Build an MCPClient whose transport factory fetches a fresh token per connection.
 
-    `connect` and `client_factory` are test seams; production uses streamable HTTP.
+    Tool names carry the `server_name` prefix unless `prefix_tools` is False (a code-owned loop
+    that calls and filters tools by their raw names). `connect` and `client_factory` are test
+    seams; production uses streamable HTTP.
     """
     open_transport = connect or _http_connect(client_factory)
 
@@ -74,7 +77,7 @@ def open_mcp_client(
         headers = {"Authorization": f"Bearer {tokens.get_token()}"}
         return open_transport(url, headers)
 
-    return MCPClient(transport, prefix=server_name)
+    return MCPClient(transport, prefix=server_name if prefix_tools else None)
 
 
 def _find_unauthorized(exc: BaseException | None, seen: set[int]) -> bool:

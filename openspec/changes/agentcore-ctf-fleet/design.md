@@ -328,3 +328,16 @@ Evidence in `spikes/FINDINGS.md`. These resolve [UNVERIFIED] markers; the rest o
 - agentic-ctf agent names are hyphen-only (`^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$`); the secret JSON keys are `client_id` and `client_secret`; the Cognito pool is destroyed with its stack (discoveryUrl drifts per redeploy). `hydrate_credentials.py` needs a runtime-name -> agentic-ctf-name mapping (`harness_sdk` -> `harness-sdk`).
 - S4: `strands-decider serve` has NO dtype flag. dtype is `torch_dtype` in the checkpoint `strands_decider_config.json` (default bfloat16). The adapter must stage a checkpoint copy with the patched value from `DECIDER_DTYPE`. The T4 numbers (p95, fp16 vs fp32, InService) are pending user execution.
 - Open questions resolved: multiple characters per sub are allowed (one MCP session = one join, names must be unique); `wait_for_turn` cap 25 s < CloudFront 120 s.
+
+## Addendum: PR2 outcomes (2026-10-15)
+- Added `shared/ctf_common/wiring.py` (runner wiring) and `strands_match.py` (Strands match loop shared by `harness_sdk` and `strand_decider`); `decider_loop` is split into `loop_logic.py` (pure) and `loop.py`; `strand_decider` has `gate.py` plus `strand_agent.py`.
+- Decider client: `GuardedDecider(transport)` with `SageMakerDecider` and `HttpDecider`; errors carry their own retry/breaker policy. botocore has no per-call read timeout, so the transport pools clients by read timeout (rounded down to 100 ms) to make the tick clamp real.
+- Harness MCP entry: no `type` key, `continue_on_error: false` (otherwise `create_harness` silently drops a server that fails to start).
+- A dead MCP connection fails the match in every runtime (Strands returns an error tool result instead of raising): `ConnectionLostHook` for the Strands runtimes, `is_connection_lost` in the plain-Python loop.
+
+## Addendum: slice 2 review fixes (2026-10-15)
+
+- Breaker: `acquire()` returns an `Admission(allowed, owns_probe, epoch)`; only the probe owner releases it, and outcomes stamped with an older epoch (epoch increments on every open and close) are ignored. `allow()` stays as a boolean shortcut.
+- Read-timeout buckets are 0.5 s steps (0.4 floor, 0.5 ... 2.5), rounded down: the SageMaker client pool holds at most 6 clients. Connect timeout is `min(1.0, read bucket)`.
+- Strand gate: a malformed decider answer fails open (`Proceed("decider unavailable")`, warning log, not counted as a guide) and the handler sets `on_error = "proceed"`.
+- TODO (revisit after the S4 benchmark): the `decider_loop` deadline split (`remaining - llm_budget`) was deliberately left unchanged in this round.
