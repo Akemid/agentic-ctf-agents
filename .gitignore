@@ -7,3 +7,4 @@ __pycache__/
 .agent/sessions/
 .atl/*
 logs/*
+.DS_Store
