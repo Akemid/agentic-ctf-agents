@@ -9,18 +9,102 @@
   },
   "runtimes": [
     {
+      "name": "harness",
+      "build": "CodeZip",
+      "entrypoint": "main.py",
+      "codeLocation": "app/harness/",
+      "runtimeVersion": "PYTHON_3_14",
+      "networkMode": "PUBLIC",
+      "protocol": "HTTP",
+      "lifecycleConfiguration": {
+        "idleRuntimeSessionTimeout": 900,
+        "maxLifetime": 14400
+      }
+    },
+    {
       "name": "harness_sdk",
       "build": "CodeZip",
       "entrypoint": "main.py",
       "codeLocation": "app/harness_sdk/",
       "runtimeVersion": "PYTHON_3_14",
       "networkMode": "PUBLIC",
-      "protocol": "HTTP"
+      "protocol": "HTTP",
+      "lifecycleConfiguration": {
+        "idleRuntimeSessionTimeout": 900,
+        "maxLifetime": 14400
+      }
+    },
+    {
+      "name": "strand_decider",
+      "build": "CodeZip",
+      "entrypoint": "main.py",
+      "codeLocation": "app/strand_decider/",
+      "runtimeVersion": "PYTHON_3_14",
+      "networkMode": "PUBLIC",
+      "protocol": "HTTP",
+      "lifecycleConfiguration": {
+        "idleRuntimeSessionTimeout": 900,
+        "maxLifetime": 14400
+      }
+    },
+    {
+      "name": "decider_loop",
+      "build": "CodeZip",
+      "entrypoint": "main.py",
+      "codeLocation": "app/decider_loop/",
+      "runtimeVersion": "PYTHON_3_14",
+      "networkMode": "PUBLIC",
+      "protocol": "HTTP",
+      "lifecycleConfiguration": {
+        "idleRuntimeSessionTimeout": 900,
+        "maxLifetime": 14400
+      }
     }
   ],
   "memories": [],
   "knowledgeBases": [],
-  "credentials": [],
+  "credentials": [
+    {
+      "authorizerType": "OAuthCredentialProvider",
+      "name": "ctf_harness",
+      "discoveryUrl": "https://discovery-url-not-hydrated.invalid/.well-known/openid-configuration",
+      "scopes": [
+        "agentic-ctf/mcp"
+      ],
+      "vendor": "CustomOauth2",
+      "usage": "outbound"
+    },
+    {
+      "authorizerType": "OAuthCredentialProvider",
+      "name": "ctf_harness_sdk",
+      "discoveryUrl": "https://discovery-url-not-hydrated.invalid/.well-known/openid-configuration",
+      "scopes": [
+        "agentic-ctf/mcp"
+      ],
+      "vendor": "CustomOauth2",
+      "usage": "outbound"
+    },
+    {
+      "authorizerType": "OAuthCredentialProvider",
+      "name": "ctf_strand_decider",
+      "discoveryUrl": "https://discovery-url-not-hydrated.invalid/.well-known/openid-configuration",
+      "scopes": [
+        "agentic-ctf/mcp"
+      ],
+      "vendor": "CustomOauth2",
+      "usage": "outbound"
+    },
+    {
+      "authorizerType": "OAuthCredentialProvider",
+      "name": "ctf_decider_loop",
+      "discoveryUrl": "https://discovery-url-not-hydrated.invalid/.well-known/openid-configuration",
+      "scopes": [
+        "agentic-ctf/mcp"
+      ],
+      "vendor": "CustomOauth2",
+      "usage": "outbound"
+    }
+  ],
   "evaluators": [],
   "onlineEvalConfigs": [],
   "agentCoreGateways": [],
