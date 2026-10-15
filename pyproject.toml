@@ -20,6 +20,7 @@ dev = [
     "bedrock-agentcore[strands-agents]>=1.24.1",
     "mcp>=1.28.1,<2",
     "ruff>=0.6",
+    "strands-harness>=0.3.0",
 ]
 
 [tool.uv]
@@ -29,7 +30,7 @@ package = false
 testpaths = ["tests", "spikes/tests"]
 # `shared` comes first so tests import the source of truth, never a vendored copy.
 # Per-runtime directories are added as each runtime is ported.
-pythonpath = ["shared", "scripts", "app/harness_sdk"]
+pythonpath = ["shared", "scripts", "app/harness_sdk", "app/harness", "app/strand_decider", "app/decider_loop"]
 asyncio_mode = "auto"
 
 [tool.ruff]
@@ -41,12 +42,23 @@ extend-exclude = ["local", "spikes", "app/*/ctf_common"]
 select = ["E", "F", "I", "UP", "B"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["ctf_common", "sdk_agent", "sync_common", "fake_mcp", "fake_model"]
+known-first-party = [
+    "ctf_common",
+    "sdk_agent",
+    "harness_agent",
+    "strand_agent",
+    "gate",
+    "loop",
+    "loop_logic",
+    "sync_common",
+    "fake_mcp",
+    "fake_model",
+]
 
 [tool.pyright]
 # Keep in sync with [tool.pytest.ini_options].pythonpath so the IDE resolves ctf_common in tests.
 include = ["shared", "tests", "scripts", "app"]
 exclude = ["local", "spikes", "**/__pycache__", "**/.venv", "app/*/ctf_common"]
-extraPaths = ["shared", "scripts", "app/harness_sdk"]
+extraPaths = ["shared", "scripts", "app/harness_sdk", "app/harness", "app/strand_decider", "app/decider_loop"]
 venvPath = "."
 venv = ".venv"
