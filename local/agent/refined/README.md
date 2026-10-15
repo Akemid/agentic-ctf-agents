@@ -6,7 +6,7 @@ Refined copies of the four agents in `agent/`. The originals are untouched.
 |------|----------|----------------------|
 | `decider_loop.py` | `agent-decider-loop.py` | One decider request now asks `threat`, `route_bad` and `action`; pure `combine_answers` switches to tag/defend on threat and to a safe same-goal route when the pick is blocked/risky (fixes ignored threats and insisting on blocked routes). |
 | `decider_loop.py` | same | A BLOCKED route is annotated "would continue your path but is BLOCKED now" instead of "continues your current path". |
-| `harness_sdk.py` | `agent-harness-sdk.py` | Sliding-window history (`--window`, ~3 ticks, first message pinned), act-fast prompt, static `walls` stripped from `wait_for_turn` results after the first turn (each tick was a full LLM turn over a growing conversation). |
+| `harness_sdk.py` | `agent-harness-sdk.py` | Sliding-window history (`--window`, ~3 ticks, first message pinned), act-fast prompt (each tick was a full LLM turn over a growing conversation). The static-`walls` stripping hook was removed: the server's turn contract v2 no longer sends walls, fields or flag bases (use `join_match.map` / `get_map`). |
 | `strand_decider.py` | `agent-strand-decider.py` | Same changes as `harness_sdk.py`; the decider reviews only `tag` and `grab_flag` (no round trip on every move/wait). |
 | `harness.py` | `agent-harness.py` | Act-fast prompt only; `programmatic_tool_caller` stays on. `create_harness` has its own context manager, so no window is set. |
 

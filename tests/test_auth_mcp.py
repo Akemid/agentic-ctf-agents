@@ -166,6 +166,9 @@ class TestOneTokenPerConnection:
         with client:
             names = [t.tool_name for t in client.list_tools_sync()]
             assert {"ctf-game_wait_for_turn", "ctf-game_move"} <= set(names)
+            client.call_tool_sync(
+                "join", "join_match", {"match_id": "m1", "team": "red"}
+            )  # wait_for_turn needs it
             for i in range(200):
                 result = client.call_tool_sync(f"id-{i}", "wait_for_turn", {})
                 assert result["status"] == "success"

@@ -1,8 +1,8 @@
 """strand_decider runtime: a Strands Agent whose `tag` and `grab_flag` calls are reviewed by the decider.
 
-Same agent as `harness_sdk` (model, prompt, MCP tools, bounded history, act-fast prompt, static walls
-stripped) plus the `ToolCallReviewer` intervention from `gate.py`. The decider is the SageMaker
-endpoint in AgentCore mode and a local `strands-decider serve` when `CTF_DECIDER_URL` is set.
+Same agent as `harness_sdk` (model, prompt, MCP tools, bounded history, act-fast prompt) plus the
+`ToolCallReviewer` intervention from `gate.py`. The decider is the SageMaker endpoint in AgentCore mode and a
+local `strands-decider serve` when `CTF_DECIDER_URL` is set.
 """
 
 from __future__ import annotations

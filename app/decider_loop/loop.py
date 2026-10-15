@@ -8,6 +8,9 @@ run, once for that tick, restricted to the action tools. No LLM is involved on t
 Ported from `local/agent/refined/decider_loop.py`. The pure decision logic is in `loop_logic.py`
 (characterization-tested against the original). Differences from the local script:
 
+- the static board map is captured once per match (`join_match.map`, else one `get_map` call) and threaded
+  into the pure functions as a `MapInfo`: the v2 turn state no longer carries it;
+
 - the decider is a `DeciderPort` (SageMaker in AgentCore, HTTP locally) with a deadline clamp, one
   bounded retry and a circuit breaker. There is no permanent "decider down" state: a failed call
   only sends THAT tick to the LLM, and the breaker decides when the endpoint is tried again;
@@ -19,13 +22,12 @@ Ported from `local/agent/refined/decider_loop.py`. The pure decision logic is in
 from __future__ import annotations
 
 import functools
-import json
 import logging
 import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import Any, NamedTuple
 
 from strands import Agent
 from strands.hooks import AfterToolCallEvent, AfterToolsEvent
@@ -48,23 +50,28 @@ from loop_logic import (
     LLM_SYSTEM_PROMPT,
     MAX_CONSECUTIVE_TOOL_ERRORS,
     THREAT_YES,
+    TOOL_GET_MAP,
     TOOL_JOIN,
     TOOL_WAIT_FOR_TURN,
+    MapInfo,
     Plan,
     Stats,
     _my_position,
     _state,
+    action_rejection,
     build_options,
     build_questions,
     choose_path,
     combine_answers,
     describe_action,
+    describe_match_over,
     extract_action_call,
     extract_tick,
     format_decision,
     infer_executed_route,
     label_to_call,
     llm_timeout_s,
+    parse_map,
     parse_noul,
     parse_tool_result,
     plan_suffix,
@@ -168,15 +175,37 @@ def call_tool(client: Any, name: str, arguments: dict[str, Any]) -> dict[str, An
     return parsed
 
 
-def join(client: Any, match: str, name: str, team: str) -> str:
-    """Join the requested team; `auto` tries red first, then blue. Returns the team joined."""
+class Joined(NamedTuple):
+    team: str
+    map_info: MapInfo | None  # None when the join result carried no usable `map`
+
+
+def join(client: Any, match: str, name: str, team: str) -> Joined:
+    """Join the requested team; `auto` tries red first, then blue. Returns the team and the static map."""
     for candidate in ("red", "blue") if team == "auto" else (team,):
         outcome = call_tool(client, TOOL_JOIN, {"match_id": match, "team": candidate, "name": name})
         if not outcome["_is_error"]:
             log.info("joined match %s as %s on team %s", match, name, candidate)
-            return candidate
+            return Joined(candidate, parse_map(outcome.get("map")))
         log.warning("join as %s failed: %s", candidate, outcome)
     raise RuntimeError(f"could not join match {match} on {'either team' if team == 'auto' else team}")
+
+
+def fetch_map(client: Any) -> MapInfo | None:
+    """The static map from `get_map`: the fallback when `join_match` did not carry it. None on failure."""
+    outcome = call_tool(client, TOOL_GET_MAP, {})
+    if outcome["_is_error"]:
+        log.warning("get_map failed: %s", outcome)
+        return None
+    return parse_map(outcome)
+
+
+def log_outcome(outcome: dict[str, Any]) -> None:
+    """Log a tool error or a rejected action ack (a normal result with a reason, not an MCP error)."""
+    if outcome["_is_error"]:
+        log.warning("    action error: %s", outcome)
+    elif (reason := action_rejection(outcome)) is not None:
+        log.warning("    action rejected: %s", reason)
 
 
 def run_llm_tick(
@@ -281,13 +310,16 @@ def run_match(ctx: MatchContext, client: Any, decider: DeciderPort, model: Any) 
     )
 
     warm_up(decider)
-    join(client, require_match_id(request), request.name, request.team)
+    joined = join(client, require_match_id(request), request.name, request.team)
+    map_info = joined.map_info or fetch_map(client)  # an older server: fetch the static map once instead
+    if map_info is None:
+        log.warning("no static map (join_match.map / get_map): field-dependent hints are off for this match")
 
     while not ctx.stop.is_set():
         turn = call_tool(client, TOOL_WAIT_FOR_TURN, {})
         status = turn.get("status")
         if status == "match_over":
-            log.info("match over: %s", json.dumps({k: v for k, v in turn.items() if not k.startswith("_")}))
+            log.info("%s", describe_match_over(turn))
             return stats
         if status != "turn":  # 'pending' (nothing arrived within the wait cap) or an error
             if turn["_is_error"]:
@@ -302,8 +334,8 @@ def run_match(ctx: MatchContext, client: Any, decider: DeciderPort, model: Any) 
         if ctx.stop.is_set():  # stop arrived while waiting: do not act on this turn
             break
         turn_received = time.monotonic()
-        state = render_state(turn, plan)
-        options_map = build_options(turn, plan)
+        state = render_state(turn, plan, map_info)
+        options_map = build_options(turn, plan, map_info)
 
         chosen: str | None = None
         confidence = 0.0
@@ -373,8 +405,7 @@ def run_match(ctx: MatchContext, client: Any, decider: DeciderPort, model: Any) 
                     confidence,
                     plan_suffix(plan),
                 )
-            if outcome["_is_error"]:
-                log.warning("    action error: %s", outcome)
+            log_outcome(outcome)
             continue
 
         if path == "wait":
@@ -393,8 +424,7 @@ def run_match(ctx: MatchContext, client: Any, decider: DeciderPort, model: Any) 
                 llm_budget_ms + margin_ms,
                 why,
             )
-            if outcome["_is_error"]:
-                log.warning("    action error: %s", outcome)
+            log_outcome(outcome)
             continue
 
         why = "decider unavailable" if unavailable else f"low confidence ({chosen}, {confidence:.2f})"
@@ -404,9 +434,10 @@ def run_match(ctx: MatchContext, client: Any, decider: DeciderPort, model: Any) 
         limit_ms = (
             llm_timeout_s(turn_remaining_ms(turn, (llm_started - turn_received) * 1000), margin_ms) * 1000
         )
+        llm_state = render_state(turn, plan, map_info, include_last_action=True)  # fallback-only text
         handler = TickCancelHandler(threading.Event())
         timed_out, llm_result = run_with_timeout(
-            functools.partial(run_llm_tick, agent_factory, state, tick, handler), limit_ms / 1000
+            functools.partial(run_llm_tick, agent_factory, llm_state, tick, handler), limit_ms / 1000
         )
         if timed_out:
             already_acted = handler.cancel_tick()  # BEFORE any fallback action
@@ -443,8 +474,7 @@ def run_match(ctx: MatchContext, client: Any, decider: DeciderPort, model: Any) 
                 f"executing decider choice {chosen} ({confidence:.2f})" if action == "decider" else "wait"
             )
             log.info("%s -> %s%s", waited, verdict, plan_suffix(plan))
-            if outcome["_is_error"]:
-                log.warning("    action error: %s", outcome)
+            log_outcome(outcome)
             continue
         calls, call = llm_result
         log.info(

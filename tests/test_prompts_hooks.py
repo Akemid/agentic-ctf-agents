@@ -39,11 +39,18 @@ class TestPrompts:
     def test_act_fast_prompt_is_verbatim(self):
         assert prompts.ACT_FAST_PROMPT == ACT_FAST
 
-    def test_system_prompt_is_unchanged(self):
-        # sha256 of SYSTEM_PROMPT in local/agent/refined/harness_sdk.py (1207 chars).
+    def test_system_prompt_is_pinned(self):
+        # sha256 of SYSTEM_PROMPT; `local/agent/refined/harness_sdk.py` must carry the identical text.
         digest = hashlib.sha256(prompts.SYSTEM_PROMPT.encode()).hexdigest()
-        assert digest == "c5386af66d85bb54424ba9502f87d6fe8bcd2fddf092e01ebef541b9da031f54"
-        assert len(prompts.SYSTEM_PROMPT) == 1207
+        assert digest == "ce2785bddb33425ded52c1717c9890bdb7581a5c543d7a09a0151faa0fb87785"
+
+    def test_system_prompt_teaches_the_v2_turn_contract(self):
+        text = prompts.SYSTEM_PROMPT
+        assert "min_enemy_distance" not in text  # removed by the server, replaced by closest_threat
+        assert "closest_threat" in text and "enemy_id, step and distance" in text
+        # The static map is not repeated in turns: say where it comes from and how to recover it.
+        assert "join_match" in text and "get_map" in text
+        assert "last_action" in text
 
     def test_system_prompt_ends_with_act_fast_and_stays_neutral(self):
         assert prompts.SYSTEM_PROMPT.endswith(ACT_FAST)
@@ -88,75 +95,10 @@ def after_event(name, result):
     return SimpleNamespace(tool_use={"name": name, "input": {}}, result=result)
 
 
-class TestStripStaticWallsHook:
-    WAIT = "ctf-game_wait_for_turn"
-
-    def payload(self, tick):
-        return {
-            "status": "turn",
-            "tick": tick,
-            "state": {"tick": tick, "walls": [{"x": 1, "y": 1}], "grid": {"width": 15}, "self": "blue-1"},
-        }
-
-    def state_of(self, event):
-        return json.loads(event.result["content"][0]["text"])["state"]
-
-    def test_first_turn_keeps_walls_later_turns_strip(self):
-        hook = hooks.StripStaticWallsHook()
-        first = after_event(self.WAIT, tool_result(self.payload(1)))
-        hook.after_tool_call(first)
-        assert "walls" in self.state_of(first)
-        second = after_event(self.WAIT, tool_result(self.payload(2)))
-        hook.after_tool_call(second)
-        state = self.state_of(second)
-        assert "walls" not in state and state["grid"] == {"width": 15}
-        assert json.loads(second.result["content"][0]["text"])["tick"] == 2
-        assert second.result["toolUseId"] == "t"
-
-    def test_unprefixed_name_also_matches(self):
-        hook = hooks.StripStaticWallsHook()
-        hook.after_tool_call(after_event("wait_for_turn", tool_result(self.payload(1))))
-        later = after_event("wait_for_turn", tool_result(self.payload(2)))
-        hook.after_tool_call(later)
-        assert "walls" not in self.state_of(later)
-
-    def test_other_tools_untouched(self):
-        hook = hooks.StripStaticWallsHook()
-        hook.after_tool_call(after_event(self.WAIT, tool_result(self.payload(1))))
-        original = tool_result({"state": {"walls": [1]}})
-        event = after_event("ctf-game_move", original)
-        hook.after_tool_call(event)
-        assert event.result is original
-        assert json.loads(event.result["content"][0]["text"])["state"]["walls"] == [1]
-
-    def test_malformed_json_left_as_is(self):
-        hook = hooks.StripStaticWallsHook()
-        hook.after_tool_call(after_event(self.WAIT, tool_result(self.payload(1))))
-        bad = {"status": "success", "toolUseId": "t", "content": [{"text": "not json {"}]}
-        event = after_event(self.WAIT, bad)
-        hook.after_tool_call(event)
-        assert event.result["content"][0]["text"] == "not json {"
-
-    def test_error_results_do_not_count_as_first_turn(self):
-        hook = hooks.StripStaticWallsHook()
-        err = {"status": "error", "toolUseId": "t", "content": [{"text": "boom"}]}
-        hook.after_tool_call(after_event(self.WAIT, err))
-        first = after_event(self.WAIT, tool_result(self.payload(1)))
-        hook.after_tool_call(first)
-        assert "walls" in self.state_of(first)
-
-    def test_register_hooks_subscribes_after_tool_call(self):
-        calls = []
-        registry = SimpleNamespace(add_callback=lambda event_type, cb: calls.append(event_type))
-        hooks.StripStaticWallsHook().register_hooks(registry)
-        assert [c.__name__ for c in calls] == ["AfterToolCallEvent"]
-
-    def test_a_new_hook_instance_starts_fresh_per_match(self):
-        first_match, second_match = hooks.StripStaticWallsHook(), hooks.StripStaticWallsHook()
-        first_match.after_tool_call(after_event(self.WAIT, tool_result(self.payload(1))))
-        event = after_event(self.WAIT, tool_result(self.payload(1)))
-        second_match.after_tool_call(event)
-        assert "walls" in self.state_of(event)
+class TestStaticMapHandling:
+    def test_the_walls_stripping_hook_is_gone(self):
+        # The server stopped sending static board data in turns (contract v2), so there is nothing to strip.
+        assert not hasattr(hooks, "StripStaticWallsHook")
 
 
 class TestConversationManager:

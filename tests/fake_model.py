@@ -23,7 +23,7 @@ class ScriptedPlayer(Model):
     def __init__(self, join_args: dict[str, Any] | None = None) -> None:
         self.calls: list[list[dict]] = []  # a snapshot of the messages for every model call
         self.system_prompts: list[str | None] = []
-        self.join_args = join_args or {"match_id": "m1", "name": "p1"}
+        self.join_args = join_args or {"match_id": "m1", "team": "red", "name": "p1"}
         self._n = 0
 
     def update_config(self, **model_config: Any) -> None:
@@ -39,11 +39,10 @@ class ScriptedPlayer(Model):
         text = _last_tool_result_text(messages)
         if text is None:
             return ("ctf-game_join_match", self.join_args)
-        if '"status": "joined"' in text:
-            return ("ctf-game_wait_for_turn", {})
-        if '"status": "ok"' in text:
-            return ("ctf-game_wait_for_turn", {})
         payload = json.loads(text) if text.startswith("{") else {}
+        # v2 contract: a join result has no `status` (it has `agent_id`); an action ack is accepted/rejected.
+        if "agent_id" in payload or payload.get("status") in ("accepted", "rejected"):
+            return ("ctf-game_wait_for_turn", {})
         if payload.get("status") == "turn":
             return ("ctf-game_move", {"tick": payload["tick"], "direction": "up"})
         return "match over, good game"

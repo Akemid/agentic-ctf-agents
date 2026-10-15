@@ -1,8 +1,8 @@
 """REFINED CTF agent (plain Strands SDK + MCP) whose tool calls are reviewed by a local strands-decider.
 
 Refined version of `agent/agent-strand-decider.py` (the original is untouched). Same agent as
-`harness_sdk.py` -- model, prompt, MCP tools, bounded history (`--window`), act-fast prompt and
-`StripStaticWallsHook` (all imported from it) -- plus an `InterventionHandler`. Change versus the
+`harness_sdk.py` -- model, prompt, MCP tools, bounded history (`--window`) and act-fast prompt
+(all imported from it) -- plus an `InterventionHandler`. Change versus the
 original review: only `tag` and `grab_flag` are gated by the decider; `move` and `wait` proceed
 immediately, so no decider round trip is paid on every move.
 
@@ -36,7 +36,6 @@ from harness_sdk import (  # noqa: E402
     DEFAULT_WINDOW,
     MODELS,
     SYSTEM_PROMPT,
-    StripStaticWallsHook,
     build_instruction,
     make_conversation_manager,
 )
@@ -245,7 +244,6 @@ def main() -> int:
         tools=clients,
         interventions=[gate],
         conversation_manager=make_conversation_manager(args.window),
-        hooks=[StripStaticWallsHook()],
     )
 
     agent(build_instruction(args.match, args.name))

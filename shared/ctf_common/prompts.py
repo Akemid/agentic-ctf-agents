@@ -1,6 +1,8 @@
 """Prompts and model aliases shared by every agent runtime.
 
-Extracted verbatim from `local/agent/refined/harness_sdk.py` (characterization-tested).
+Kept in lockstep with `local/agent/refined/harness_sdk.py` (`tests/test_prompts_hooks.py` compares them).
+The prompt follows the game server's MCP turn contract v2: static board data comes from `join_match.map` /
+`get_map`, route options carry `closest_threat`, and every turn carries `last_action`.
 """
 
 from __future__ import annotations
@@ -28,9 +30,15 @@ SYSTEM_PROMPT = (
     "server (ids like enemy_flag_direct, enemy_flag_safe, enemy_flag_detour, own_base_*, "
     "tag:<enemy_id>, defend_flag). The server never recommends one; you choose. Weigh each "
     "route's length, blocked_now/blocked_reason, risks (cells where you can be tagged) and "
-    "min_enemy_distance, then call move with that route's first_step. A tag route with "
+    "closest_threat (the nearest enemy that can tag you along that route, as enemy_id, step and "
+    "distance in moves around walls, or null when there is none), then call move with that "
+    "route's first_step. A tag route with "
     "length 0 means the enemy is adjacent: call tag with that enemy_id. Call grab_flag when "
     "standing on the enemy flag. Call exactly one action per tick, with the current tick."
+    " The board never changes, so turns do not repeat it: join_match returns it once as `map` "
+    "(grid, walls, fields, flag_bases) and get_map returns it again at any time. If you lose "
+    "track of the layout, call get_map. Each turn also carries last_action, the outcome of your "
+    "previous action (null on your first turn); use it to notice a blocked or rejected move."
     " " + ACT_FAST_PROMPT
 )
 

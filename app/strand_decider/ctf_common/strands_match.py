@@ -19,7 +19,6 @@ from .hooks import (
     DEFAULT_WINDOW,
     ConnectionLostHook,
     StopRequestedHook,
-    StripStaticWallsHook,
     TickCounterHook,
     make_conversation_manager,
 )
@@ -66,7 +65,6 @@ def play_strands_match(
                 tools=client.list_tools_sync(),
                 conversation_manager=make_conversation_manager(window),
                 hooks=[
-                    StripStaticWallsHook(),
                     TickCounterHook(ctx.tick),
                     StopRequestedHook(ctx.stop),
                     connection,
