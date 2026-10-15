@@ -99,3 +99,69 @@ Phases 2-4 (PR2-PR4), plus user actions 0.4 / 0.7.
 - `test_prompts_hooks.py`: prompts compared against the refined original (importlib) besides the sha256.
 - `pyproject.toml`: `[tool.pyright]` (extraPaths mirror pytest pythonpath). READMEs document stop latency (~25 s `wait_for_turn` cap; `StopRuntimeSession` is the hard stop).
 - Results: 228 passed; ruff check/format clean; sync_common --check OK; cdk jest 1 passed.
+
+
+---
+
+## Batch PR2 (Phase 2) - 2026-10-15
+Mode: Strict TDD. Delivery: chained PRs, stacked-to-main (PR2 of PR0..PR4). Branch: `feat/agentcore-ctf-fleet-slice2` (uncommitted; orchestrator reviews first). `local/`, `agentcore/agentcore.json` and `agentcore/aws-targets.json` untouched.
+
+### Task status (cumulative)
+- Phases 0 and 1: unchanged from the batches above (0.4 and 0.7 remain `[~]`, user actions).
+- [x] 2.1/2.2 `shared/ctf_common/decider.py`. [x] 2.3 `app/harness`. [x] 2.4 `app/decider_loop`. [x] 2.5 `app/strand_decider`. [x] 2.6 sync + check. [x] 2.7 verify. [x] 2.8 blog notes (D22-D28).
+- [ ] 2.9 deferred (reason in tasks.md). Phases 3-4 untouched.
+
+### TDD Cycle Evidence
+| Task | Test file | RED | GREEN | TRIANGULATE | REFACTOR |
+|------|-----------|-----|-------|-------------|----------|
+| 2.1/2.2 decider client | `tests/test_decider_client.py` (59) | ModuleNotFoundError `ctf_common.decider` | 59 passed | every error-map row, clamp x4, skip (+breaker untouched), retry x4, breaker transitions, probe release, HTTP transport, logging leak | ruff `UP041` |
+| wiring (shared) | `tests/test_wiring.py` (10) | ModuleNotFoundError `ctf_common.wiring` | 10 passed | SSM vs local overrides, decider param missing, token from env | `harness_sdk` moved onto it (its 19 tests were the safety net) |
+| `is_connection_lost`, `prefix_tools` | `tests/test_prompts_hooks.py`, `tests/test_auth_mcp.py` | 9 failed | 71 passed | marker/ordinary error/success/malformed | `ConnectionLostHook` uses the pure function |
+| `strands_match` | `tests/test_sdk_agent.py` (19, existing) | approval tests: green before and after | 19 passed | n/a | extracted from `sdk_agent.play` |
+| 2.3 harness | `tests/test_harness_agent.py` (17) | ModuleNotFoundError `harness_agent` | 17 passed | 3 models, real HTTP 401, dead server, stop, hooks, state dirs; mutation: removing `agent.cleanup()` fails the 401 test | dropped `type` key (not a `MCPServerConfig` field) |
+| 2.5 gate + agent | `tests/test_gate.py` (24), `tests/test_strand_agent.py` (9) | ModuleNotFoundError `gate` / `strand_agent` | 33 passed | guide/proceed/cap/reset/fail-open/no permanent down, e2e block+continue, parity with local `QUESTIONS`/`_render` | none |
+| 2.4 loop_logic | `tests/test_loop_logic.py` (586) | ModuleNotFoundError `loop_logic` (port moved away until the test existed) | 586 passed | corpus of 8 turns x 5 plans, grids for combine_answers/choose_path/continues_path; mutation `>=` to `>` in `combine_answers` fails | none |
+| 2.4 loop | `tests/test_decider_loop.py` (24) | ModuleNotFoundError `loop` | 24 passed after strengthening the 401 test with a call spy (a first version passed even with the connection-lost check removed; verified by mutation) | decider path, warm-up, join red/blue/fixed/fail, LLM fallback, budget, wait, no permanent down, stop, 401 | `functools.partial` instead of a loop-variable lambda |
+| 2.7 entrypoints/deps | `tests/test_entrypoints.py` (33), `tests/test_runtime_deps.py` (18) | config/characterization style: pass on first run (modules existed) | 51 passed | per-runtime options accepted/rejected | none |
+
+### Test results
+- `uv run --with pytest pytest`: 1018 passed (790 new in this slice), 88 warnings (upstream pydantic deprecation, `MCPClient.stop` coroutine on a failed start, strands context-window notice).
+- `cd agentcore/cdk && npx jest`: 1 passed (untouched).
+- `ruff check .` and `ruff format --check` clean (vendored copies excluded); `scripts/sync_common.py --check` OK.
+- CodeZip simulation (`uv pip install -r app/<rt>/pyproject.toml --python-version 3.14 --python-platform aarch64-manylinux_2_28 --only-binary :all:`): harness 141 MB unpacked / 57 MB zipped; harness_sdk 110 / 42; strand_decider 110 / 42; decider_loop 110 / 43. No torch, nvidia or triton in any of them.
+
+### Deviations from design
+- `harness`: `mcp_servers` entry has no `type` key (not a `MCPServerConfig` field; strands warned and ignored it; `url` implies streamable HTTP) and sets `continue_on_error: false`: `create_harness` otherwise skips a server that fails to start and the agent would play without game tools.
+- Added shared modules not in the layout: `wiring.py` (runner wiring) and `strands_match.py` (Strands match loop used by `harness_sdk` and `strand_decider`), so the four runtimes do not carry four copies. `harness_sdk/sdk_agent.py` refactored onto them (tests unchanged and green).
+- `decider_loop` is split into `loop_logic.py` (pure, verbatim port) and `loop.py` (play, LLM fallback guards); the design names only `loop.py`.
+- `open_mcp_client(prefix_tools=False)` and `hooks.is_connection_lost` added to `ctf_common` (the loop calls tools by raw name and checks results itself).
+- botocore cannot set a per-call read timeout: the SageMaker transport keeps a pool of clients keyed by read timeout (rounded down to 100 ms) so the tick clamp is real, not just a ceiling.
+- `decider_loop` still sends the warm-up question; a failed warm-up is logged and the breaker handles availability (no permanent down).
+- `tests/fake_mcp.py` gained `wait`/`tag`/`grab_flag` tools, `state`/`deadline_remaining_ms`/`reject_teams` options and the shared 401 handler; `tests/fake_model.py` gained `SequencePlayer`.
+- 2.9 not done (reason in tasks.md).
+
+### Files
+Created: `shared/ctf_common/{decider,wiring,strands_match}.py`, `app/harness/{harness_agent,main}.py`, `app/strand_decider/{gate,strand_agent,main}.py`, `app/decider_loop/{loop_logic,loop,main}.py`, `app/{harness,strand_decider,decider_loop}/{pyproject.toml,README.md}`, `app/{harness,strand_decider,decider_loop}/ctf_common/*` (GENERATED), `tests/{test_decider_client,test_wiring,test_harness_agent,test_gate,test_strand_agent,test_loop_logic,test_decider_loop,test_entrypoints,test_runtime_deps}.py`.
+Modified: `shared/ctf_common/{hooks,mcp}.py` and README, `app/harness_sdk/sdk_agent.py`, `app/harness_sdk/ctf_common/*` (GENERATED), `pyproject.toml` (strands-harness dev dep, pythonpath, isort), `uv.lock` (GENERATED), `tests/{fake_mcp,fake_model,test_auth_mcp,test_prompts_hooks,test_sdk_agent}.py`, `openspec/changes/agentcore-ctf-fleet/{tasks,apply-progress}.md`, `../blog-notes/agentcore-ctf-technical-decisions.md` (outside the repo, D22-D28).
+
+### Remaining
+Phases 3-4 (PR3-PR4), 2.9 follow-up, and user actions 0.4 / 0.7. Slice 4 must add the three runtimes to `agentcore.json` (not done here by design).
+
+## Slice 2 review fixes (judgment-day round 2)
+
+All behavior fixes were test-first (RED then GREEN). Supersedes the "rounded down to 100 ms" deviation above: buckets are now 0.5 s.
+
+| Fix | Where | Test |
+| --- | --- | --- |
+| Only the probe owner releases it (`CircuitBreaker.acquire()` -> `Admission.owns_probe`) | `shared/ctf_common/decider.py` | `TestProbeOwnership` (4 tests; interleaved A/B on a fake clock with `threading.Event`) |
+| Breaker epoch: stale success/failure ignored | `decider.py` | `TestBreakerEpoch` (3) |
+| Malformed answers fail open, `on_error="proceed"` | `app/strand_decider/gate.py` | `TestMalformedAnswersFailOpen` (13) |
+| Connect timeout `min(1.0, read)` | `decider.py` | `TestConnectTimeout` |
+| 0.5 s read buckets, pool <= 6 | `decider.py` | `TestTimeoutBuckets` (9) |
+| Unserializable state -> `DeciderRejected` | `decider.py` | `TestUnserializableState` |
+| `last` unbound: explicit guard instead of assert | `decider.py` | n/a (pyright did not report it on this version) |
+| `.venv`/`__pycache__` skipped in rglob | `tests/test_runtime_deps.py` | n/a (test infra) |
+| SSM factory resolved at call time | `shared/ctf_common/wiring.py` | `test_the_default_ssm_factory_is_resolved_at_call_time` |
+| `require_match_id` | `payload.py`, `strands_match.py`, `harness_agent.py`, `loop.py` | `TestRequireMatchId` (2) |
+
+Results: pytest 1052 passed; ruff check/format clean; `sync_common --check` OK; jest 1 passed; pyright source errors 14 -> 10 (the rest are pre-existing: `name` property override x2 handlers, loop_logic Optional x5, auth.py:74). `decider_loop` deadline split intentionally untouched (TODO in design.md addendum).
