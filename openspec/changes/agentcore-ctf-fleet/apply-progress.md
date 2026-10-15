@@ -165,3 +165,81 @@ All behavior fixes were test-first (RED then GREEN). Supersedes the "rounded dow
 | `require_match_id` | `payload.py`, `strands_match.py`, `harness_agent.py`, `loop.py` | `TestRequireMatchId` (2) |
 
 Results: pytest 1052 passed; ruff check/format clean; `sync_common --check` OK; jest 1 passed; pyright source errors 14 -> 10 (the rest are pre-existing: `name` property override x2 handlers, loop_logic Optional x5, auth.py:74). `decider_loop` deadline split intentionally untouched (TODO in design.md addendum).
+
+## Batch PR3 (Phase 3) - 2026-10-15
+Mode: Strict TDD. Delivery: chained PRs, stacked-to-main (PR3 of PR0..PR4). Branch: `feat/agentcore-ctf-fleet-slice3` (uncommitted; orchestrator reviews first). `local/`, `agentcore/agentcore.json`, `agentcore/aws-targets.json` untouched. No AWS-mutating command was run (no deploy, CodeBuild or ECR push).
+
+### Task status (cumulative)
+- Phases 0, 1, 2: unchanged (0.4 and 0.7 `[~]` user actions; 2.9 deferred).
+- [x] 3.1 scaffold. [x] 3.2 persistent stack. [x] 3.3 decider stack. [x] 3.4 adapter app + warm-up. [x] 3.5 supervisor + `__main__`. [x] 3.6 Dockerfile, Dockerfile.local, build script, smoke script. [~] 3.7 automated part done; manual deploy/InService/ping/teardown awaits the user (needs 0.1). [x] 3.8 blog notes D29-D34.
+- Phase 4 untouched.
+
+### TDD Cycle Evidence
+| Task | Test file | RED | GREEN | TRIANGULATE | REFACTOR |
+|------|-----------|-----|-------|-------------|----------|
+| 3.2 persistent stack | `infra/decider/test/persistent-stack.test.ts` (14) | TS2307 `../lib/persistent-stack` | 14 passed | email from prop/env/missing, exact notifications, push policy scoped, no export | n/a |
+| 3.3 decider stack | `test/decider-stack.test.ts` (18) | TS2307 `../lib/decider-stack` | 17 then 18 passed (ordering test added after noticing the role policy race) | context overrides (dtype, AMI, tag), IAM wildcard audit, no Fn::ImportValue | `ArnFormat` instead of a cast |
+| app selector | `test/app.test.ts` (4) | TS2307 `../lib/app` | 4 passed | tag only, email only, both, env email, neither | n/a |
+| path resolution | `test/paths.test.ts` (3) | TS2307 `../lib/paths` | 3 passed (after fixing the failing-case fixture) | ts-jest layout, dist layout, missing | n/a |
+| 3.4 adapter app | `tests/test_adapter_app.py` (22) | ModuleNotFoundError `adapter.config` | 22 passed (3 fixed: `_error` kwarg clash, MockTransport ignores timeouts so the 504 test raises ReadTimeout and a second test checks the timeout passed) | FIFO x5, 8th accepted/9th rejected, timeout frees the place, disconnect keeps the slot, 4 upstream failure shapes. Mutations: no shield, `>` instead of `>=`, release outside the callback: all fail | n/a |
+| 3.5 supervisor | `tests/test_adapter_supervisor.py` (13) | ModuleNotFoundError `adapter.supervisor` | 13 passed | warm-up gating, startup timeout, early death, restart once, second death permanent, 3 vs <3 health failures, stop | n/a |
+| config/stage/hash/warm-up | `tests/test_adapter_support.py` (20) | ModuleNotFoundError | 20 passed | defaults, overrides, 4 invalid values, 5 stage cases, 5 hash cases | n/a |
+| e2e + client contract | `tests/test_adapter_e2e.py` (5) | ModuleNotFoundError `adapter.runtime` | 5 passed | real child process: ready, not-ready 503, kill once (restart) then kill again (permanent); `SageMakerDecider` round trip through the adapter; warm-up body equals `warmup_question()` | n/a |
+| 3.6 build inputs | `tests/test_adapter_build.py` (25) | ModuleNotFoundError `adapter.bake` | 25 passed | Dockerfile static audit (digest, amd64, pins, offline order, exec ENTRYPOINT), bake x5, build script with a fake `aws` (no `--yes` means zero calls), public-repo hygiene scan | n/a |
+| runtime isolation | `tests/test_runtime_deps.py` (+4) | guard test: passes on first run (nothing leaks) | 22 passed | per runtime | n/a |
+
+### Test results
+- `uv run pytest`: 1141 passed (89 new), 89 warnings. `ruff check .` clean, `ruff format` clean on changed trees, `pyright infra/decider/adapter`: 0 errors, `sync_common --check` OK, `shellcheck infra/decider/scripts/*.sh` clean.
+- `cd infra/decider && npx jest`: 4 suites, 39 passed. `cd agentcore/cdk && npx jest`: 1 passed (untouched).
+- `cdk synth CtfPersistentStack -c budgetEmail=... ` and `cdk synth DeciderStack -c imageTag=...`: both exit 0; no Outputs, no Exports; `cdk synth` with no context fails with the intended message.
+- Local Docker smoke (`infra/decider/scripts/smoke_local.sh`, amd64 emulation on Apple Silicon, about 20 s): /ping 200 after warm-up, /invocations 200 with `adapter.queue_wait_ms`, invalid body 400. The image runs on Python 3.11.
+
+### Deviations from design
+- Budget uses direct EMAIL subscribers, not an SNS topic (no topic policy needed).
+- `scripts/build_image.sh` (CodeBuild, `--yes`) replaces the design's `scripts/decider_image.sh`; added `Dockerfile.local`, `scripts/smoke_local.sh`, `Makefile`, `adapter/hash_source.py`, `adapter/adapter/{bake,stage,runtime,fake_decider}.py`.
+- dtype is patched at container start-up from `DECIDER_DTYPE` (a runtime env var of the Model), with the same key check at build time (fails the image build).
+- Restart on 3 consecutive failed health checks (process exit restarts immediately), to avoid killing a decider that is merely busy.
+- `lib/app.ts` builds a stack only when its input is present (`cdk deploy <name>` does not tell the app the stack name).
+- Model sets `EnableNetworkIsolation: true` and the variant pins `InferenceAmiVersion` (overridable by context).
+
+### [UNVERIFIED]
+- Real GPU image build (CodeBuild, Docker Hub pull rate limits for `pytorch/pytorch`), image size, InService time (<= 20 min), `refs/main` trick for offline base-model loading, `strands-decider` accepting `--host`, network isolation with a custom container, `al2-ami-sagemaker-inference-gpu-3-1` on g4dn, Budgets CFN resource in a non-us-east-1 region, Cost Explorer service name `Amazon SageMaker`.
+
+### Files
+Created: `infra/decider/{package.json,package-lock.json (GENERATED),tsconfig.json,jest.config.js,cdk.json,.gitignore,Makefile,README.md}`, `infra/decider/bin/decider.ts`, `infra/decider/lib/{app,decider-stack,persistent-stack,names,paths}.ts`, `infra/decider/test/{app,decider-stack,persistent-stack,paths}.test.ts`, `infra/decider/adapter/{Dockerfile,Dockerfile.local,.dockerignore,hash_source.py}`, `infra/decider/adapter/adapter/{__init__,__main__,app,bake,config,fake_decider,runtime,stage,supervisor,warmup}.py`, `infra/decider/adapter/adapter/warmup_body.json` (GENERATED from `warmup_question()`; drift test), `infra/decider/scripts/{build_image.sh,smoke_local.sh}`, `tests/test_adapter_{app,supervisor,support,e2e,build}.py`.
+Modified: `pyproject.toml` (pythonpath/isort/pyright for the adapter), `tests/test_runtime_deps.py`, `design.md` (addendum), `tasks.md`. Outside the repo: `../blog-notes/agentcore-ctf-technical-decisions.md` (D29-D34).
+
+### Remaining
+Phase 4 (PR4), user actions 0.4 / 0.7 / 3.7 manual, 2.9 follow-up.
+
+## Batch PR3 review fixes (judgment-day round) - 2026-10-15
+Mode: Strict TDD. Branch `feat/agentcore-ctf-fleet-slice3` (uncommitted). No AWS-mutating command and no Cost Explorer call were run; read-only ECR calls (`describe-images`, `batch-get-image`, `get-download-url-for-layer` on the AWS DLC registry) verified the base image.
+
+### Fix status
+| # | Fix | Test evidence (RED -> GREEN) |
+|---|-----|------------------------------|
+| 1 BLOCKER | both stacks always built, error annotation blocks deploy, destroy needs no inputs; Makefile targets | jest `app.test.ts` rewritten: RED (TS2305 missing exports, 5 failing); GREEN. `TestMakefile` (3, `make -n`): RED 3 failed -> GREEN. CLI: `cdk ls` and no-context synth of one stack: see results |
+| 2 | gate holds the slot and drains via `/health` (bounded), else `report_unhealthy` -> restart; waiters get 503 `not_ready` | `TestDrainAfterUpstreamFailure` (4): RED (TypeError unknown config field) -> GREEN; fake upstream keeps computing after the timeout, events order and `max_active == 1` asserted |
+| 3 | probes skipped when busy, typed probe outcome (`Probe`), refused/process exit = immediate, idle timeouts x3, overlap discarded | `TestProbeDuringInference` (6) + `TestUpstreamHealthProbe` (4): RED (ImportError `Probe`) -> GREEN |
+| 4 | AWS DLC base, no `# syntax`, `torch==2.7.1`, ENTRYPOINT/CMD override, buildspec ECR login, role pull policy | pytest Dockerfile audit (6 new): RED 5 failed -> GREEN; jest (3 new): RED (TS2305) -> GREEN |
+| 5 | NaN/Infinity -> 502; `adapter` key merged / `upstream_adapter` | `TestResponseShaping` (6): RED (ValueError from JSONResponse, assertions) -> GREEN |
+| 6 | disconnect check after acquiring the slot; done-callback retrieves the exception; `asyncio.shield` replaced | `TestClientDisconnect` RED -> GREEN; `TestUnretrievedTaskExceptions` RED ("exception in shielded future" reported by asyncio) -> GREEN |
+| 7 | spawn/stage errors -> terminal `failed`; child terminated on stop/cancel during warm-up | `TestFailureSurfaces` (6) + e2e `TestSpawnFailures` (3). Mutation check on the threaded-staging wiring: fails as expected |
+| 8 | `stage_checkpoint_async` (`asyncio.to_thread`) used by `runtime.spawn` | `TestStageCheckpointAsync` (2): RED (ImportError) -> GREEN |
+| 9 | `ADAPTER_HEALTH_FAILURES`, `ADAPTER_WARMUP_TIMEOUT_S` (+ drain knobs) exposed; README table | config tests (+ 8 invalid values) and README-documents-every-variable test: RED -> GREEN |
+| 10 | `PutMetricData` with namespace condition; confused-deputy trust conditions | jest `decider-stack.test.ts` (2 new + 1 adjusted): RED -> GREEN |
+| 11 | only `ImageNotFoundException` builds; `--model-id` removed; single model-id definition | `TestBuildImageScript` (+4), `TestPinnedModelId` (3): RED -> GREEN |
+| 12 | `CODEBUILD_BUILD_SUCCEEDING` guard before `docker push` | jest: RED -> GREEN |
+| 13 | hash parity with the unzipped asset incl. exclusion set | `TestHashParityWithTheUploadedSource` (5): characterization, GREEN on first run (no bug found); asset excludes and hash exclusions asserted equal |
+
+### Results
+- `uv run --with pytest pytest`: 1202 passed (1141 before); adapter tests 146. `infra/decider` jest: 4 suites, 49 passed (39 before). `agentcore/cdk` jest: 1 passed. `ruff check .` clean; `ruff format --check .` flags only `openspec/changes/agentcore-ctf-fleet/design.md:106` (a Python snippet from an earlier slice, pre-existing, untouched); pyright on `infra/decider/adapter`: 0 errors; shellcheck clean. Adapter tests also pass on Python 3.11 (isolated env).
+- `cdk synth` with no context: `ls` exit 0; `synth DeciderStack` and `synth CtfPersistentStack` exit 1 with the annotation message; `synth` (both) exit 1. With context: `synth DeciderStack -c imageTag=...`, `synth CtfPersistentStack -c budgetEmail=...`, both together, and `CTF_BUDGET_EMAIL` env: exit 0. `cdk destroy` was NOT run (mutating); its no-validation behavior is read from the CLI source (`selectStacksForDestroy`).
+- `scripts/smoke_local.sh`: OK (ping 200, invocations 200 with `adapter.queue_wait_ms`, invalid body 400); the smoke image was removed afterwards.
+
+### Decisions and caveats
+- DLC `pytorch-inference:2.6.0-gpu-py312-cu124-ubuntu22.04-sagemaker@sha256:f5c455...` (CUDA 12.4, Python 3.12). Newer DLC lines are CUDA 13 (driver 550 cannot run them); 2.6 is past its end of patching (2026-06-30). `torch==2.7.1` pinned. [UNVERIFIED] real GPU build and run on the DLC, `/health` blocking while the decider computes, `PutMetricData` namespace not re-checked in the docs tool (ToolSearch was unavailable to this agent), Budget filter string `Amazon SageMaker`.
+- The hygiene test allow-lists `763104351884` (AWS's public DLC registry account).
+
+### Files changed in this round
+`infra/decider/lib/{app,decider-stack,persistent-stack}.ts`, `infra/decider/test/{app,decider-stack,persistent-stack}.test.ts`, `infra/decider/{Makefile,README.md,cdk.json}`, `infra/decider/adapter/{Dockerfile,Dockerfile.local}`, `infra/decider/adapter/adapter/{app,config,runtime,stage,supervisor,warmup}.py`, `infra/decider/scripts/build_image.sh`, `tests/test_adapter_{app,build,e2e,supervisor,support}.py`, `design.md`, `tasks.md`, `apply-progress.md`.

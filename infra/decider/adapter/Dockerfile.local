@@ -1,0 +1,23 @@
+# Lightweight image to build and smoke-test the adapter WITHOUT a GPU: no torch, no weights.
+# The upstream decider is the fake in adapter/fake_decider.py. Same entrypoint as the GPU image, so it
+# exercises the exec-form ENTRYPOINT, the `serve` argument, /ping and /invocations.
+#   scripts/smoke_local.sh
+# Same ECR Public base as the GPU image (no Docker Hub).
+FROM public.ecr.aws/docker/library/python:3.11.17-slim-bookworm@sha256:0a310eeecf4e1f5a0743f9a6520c90c88d089c903ca5fd283f501e3a805f5f89
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN pip install "fastapi==0.143.1" "uvicorn==0.54.0" "httpx==0.28.1"
+
+WORKDIR /opt/decider
+COPY adapter /opt/decider/adapter
+
+ENV DECIDER_UPSTREAM_COMMAND="python -m adapter.fake_decider" \
+    ADAPTER_STARTUP_TIMEOUT_S=60
+
+EXPOSE 8080
+
+ENTRYPOINT ["python", "-m", "adapter"]
+CMD ["serve"]

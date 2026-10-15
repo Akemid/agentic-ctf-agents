@@ -29,8 +29,17 @@ package = false
 [tool.pytest.ini_options]
 testpaths = ["tests", "spikes/tests"]
 # `shared` comes first so tests import the source of truth, never a vendored copy.
-# Per-runtime directories are added as each runtime is ported.
-pythonpath = ["shared", "scripts", "app/harness_sdk", "app/harness", "app/strand_decider", "app/decider_loop"]
+# Per-runtime directories are added as each runtime is ported. The SageMaker adapter is NOT a runtime: it is
+# only importable here so its tests run; its dependencies never enter the agent runtimes.
+pythonpath = [
+    "shared",
+    "scripts",
+    "app/harness_sdk",
+    "app/harness",
+    "app/strand_decider",
+    "app/decider_loop",
+    "infra/decider/adapter",
+]
 asyncio_mode = "auto"
 
 [tool.ruff]
@@ -50,6 +59,8 @@ known-first-party = [
     "gate",
     "loop",
     "loop_logic",
+    "adapter",
+    "hash_source",
     "sync_common",
     "fake_mcp",
     "fake_model",
@@ -57,8 +68,8 @@ known-first-party = [
 
 [tool.pyright]
 # Keep in sync with [tool.pytest.ini_options].pythonpath so the IDE resolves ctf_common in tests.
-include = ["shared", "tests", "scripts", "app"]
+include = ["shared", "tests", "scripts", "app", "infra/decider/adapter"]
 exclude = ["local", "spikes", "**/__pycache__", "**/.venv", "app/*/ctf_common"]
-extraPaths = ["shared", "scripts", "app/harness_sdk", "app/harness", "app/strand_decider", "app/decider_loop"]
+extraPaths = ["shared", "scripts", "app/harness_sdk", "app/harness", "app/strand_decider", "app/decider_loop", "infra/decider/adapter"]
 venvPath = "."
 venv = ".venv"
