@@ -1,0 +1,27 @@
+{
+  "name": "ctf-decider-infra",
+  "version": "0.1.0",
+  "private": true,
+  "description": "CDK app for the CTF SageMaker decider (CtfPersistentStack + DeciderStack). Separate from agentcore deploy.",
+  "bin": {
+    "decider": "dist/bin/decider.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "jest",
+    "synth": "npm run build && cdk synth",
+    "clean": "rm -rf dist cdk.out"
+  },
+  "devDependencies": {
+    "@types/jest": "~29.5.14",
+    "@types/node": "~24.13.3",
+    "jest": "~29.7.0",
+    "ts-jest": "~29.4.11",
+    "aws-cdk": "~2.1126.0",
+    "typescript": "~5.9.3"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "~2.261.0",
+    "constructs": "~10.7.0"
+  }
+}
