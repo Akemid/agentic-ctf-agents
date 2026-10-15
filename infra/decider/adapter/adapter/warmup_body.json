@@ -1,0 +1,33 @@
+{
+  "state": "tick: 12\nyou: blue-1 (blue) at (9, 7), in your own field\ncarrying the flag: no\ncurrent plan: goal enemy_flag since tick 9 — no offered route continues that path\nscore: red 1, blue 0\nenemy red-1 at (5, 6), carrying: no\nenemy red-2 at (4, 9), carrying: no\nenemy red-3 at (2, 7), carrying: no\nteammates: [{\"id\": \"blue-2\", \"position\": {\"x\": 11, \"y\": 4}}]\nroutes:\n  enemy_flag_direct: goal enemy_flag, 8 steps, first step left, 1 risk: can be tagged by red-1 at step 3, nearest enemy 2\n  enemy_flag_detour: goal enemy_flag, 11 steps, first step up, nearest enemy 4\n  tag:red-1: goal tag red-1, 4 steps, first step left, nearest enemy 4\n  home_base: goal own_base, 4 steps, first step right, BLOCKED now (contention), nearest enemy 3\nrecent events: moved red-1 (6, 6)->(5, 6)",
+  "model": "hobson-latest",
+  "questions": {
+    "threat": {
+      "type": "noul",
+      "instructions": "Is there a threat to your flag right now? Answer true when an enemy is inside your own field close to your flag, or an enemy is carrying your flag.",
+      "criteria": {
+        "true": "an enemy is inside my own field and close to my flag, or is carrying my flag",
+        "false": "no enemy is inside my own field close to my flag and none is carrying my flag"
+      }
+    },
+    "route_bad": {
+      "type": "noul",
+      "instructions": "Is the route you would continue now a bad one? Answer true when it is blocked right now or passes next to an enemy who can tag you.",
+      "criteria": {
+        "true": "the route I would continue is blocked now, or passes next to an enemy who can tag me",
+        "false": "the route I would continue is open and no enemy can tag me along it"
+      }
+    },
+    "action": {
+      "type": "choice",
+      "instructions": "You are a player in a Capture the Flag game. Choose the single best action for this tick. Reach the enemy flag, grab it, and carry it back to your own base. The options are routes offered by the server: choose between them by weighing length, whether they are blocked right now, and the risk of being tagged along the way. Tag enemies inside your own field when it helps, and defend your flag when it is threatened. Your current plan, if any, is shown, and routes that continue your current path are marked; route ids are recomputed every tick and do not mean the same path from one tick to the next. Keep or change the plan based on the current situation.",
+      "criteria": {
+        "enemy_flag_direct": "goal enemy_flag, 8 steps, first step left, 1 risk: can be tagged by red-1 at step 3, nearest enemy 2 | same goal as your current plan, different path",
+        "enemy_flag_detour": "goal enemy_flag, 11 steps, first step up, nearest enemy 4 | same goal as your current plan, different path",
+        "tag:red-1": "goal tag red-1, 4 steps, first step left, nearest enemy 4",
+        "home_base": "goal own_base, 4 steps, first step right, BLOCKED now (contention), nearest enemy 3",
+        "wait": "do nothing this tick"
+      }
+    }
+  }
+}

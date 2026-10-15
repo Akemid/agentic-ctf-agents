@@ -41,6 +41,13 @@ class TestPerRuntime:
         assert declared  # the audit looked at something
         assert not {d for d in declared if d.startswith(FORBIDDEN)}
 
+    def test_the_sagemaker_adapter_stack_stays_out_of_the_runtimes(self, runtime):
+        """FastAPI/uvicorn belong to infra/decider/adapter (its Dockerfile pins them), not to a CodeZip."""
+        declared = names(dependencies(runtime))
+        assert not {d for d in declared if d.startswith(("fastapi", "uvicorn"))}
+        for path in _sources(ROOT / "app" / runtime):
+            assert not re.search(r"^\s*(import|from)\s+adapter\b", path.read_text(), re.M), path
+
     def test_python_matches_the_runtime_version(self, runtime):
         data = tomllib.loads((ROOT / "app" / runtime / "pyproject.toml").read_text())
         assert data["project"]["requires-python"] == ">=3.13"
