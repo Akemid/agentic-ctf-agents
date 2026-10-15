@@ -46,6 +46,11 @@ The design relies on the access-token validity of the agent M2M Cognito client (
 - WHEN the agent sees it
 - THEN the match status becomes `failed` with an auth reason, and no new token is requested
 
+#### Scenario: Mid-match 401
+- GIVEN the MCP handshake and `tools/list` succeeded and the match is running
+- WHEN a later `tools/call` returns HTTP 401 (Strands reports it to the model only as a closed-connection tool error)
+- THEN the agent loop ends after that tool batch (the model is not left retrying), the match status becomes `failed` with an auth reason, and no new token is requested
+
 ### Requirement: Secrets never logged or committed
 Client secrets MUST NOT appear in logs, CloudWatch, payloads, or tracked files; `agentcore/.env.local` MUST be gitignored.
 

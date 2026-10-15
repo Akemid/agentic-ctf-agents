@@ -15,9 +15,9 @@ testing:
       framework: "jest 29 + ts-jest"
       status: working (1 suite, 1 test passing)
     python:
-      command: "cd app/harness_sdk && uv run --with pytest pytest"
-      framework: "pytest (not yet a declared dependency; no tests exist)"
-      status: requires adding pytest as a dev dependency
+      command: "uv run --with pytest pytest"
+      framework: "pytest + pytest-asyncio (root pyproject.toml dev group, Python 3.14)"
+      status: working (run from the repository root)
   layers:
     unit: {available: true, tool: "jest (CDK); pytest after setup (Python)"}
     integration: {available: false, tool: null}

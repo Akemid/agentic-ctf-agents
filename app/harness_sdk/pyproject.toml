@@ -4,17 +4,19 @@ build-backend = "hatchling.build"
 
 [project]
 name = "harness_sdk"
-version = "0.1.0"
-description = "AgentCore Runtime Application using Strands SDK"
+version = "0.2.0"
+description = "CTF character played by a plain Strands Agent (AgentCore Runtime, CodeZip)"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.13"
 dependencies = [
     "aws-opentelemetry-distro ~= 0.18.0",
-    "bedrock-agentcore[strands-agents] >= 1.18.1",
+    "bedrock-agentcore[strands-agents] >= 1.24.1",
+    "boto3 >= 1.35",
     "botocore[crt] >= 1.35.0",
+    "httpx >= 0.27",
     "mcp >= 1.28.1, < 2.0.0",
-    "strands-agents >= 1.15.0",
-    
+    # >= 1.61: AfterToolsEvent.end_turn (used by StopRequestedHook) was verified on 1.61.
+    "strands-agents >= 1.61",
 ]
 
 [tool.hatch.build.targets.wheel]

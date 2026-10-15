@@ -7,3 +7,8 @@ spikes/**/answers-*.json
 
 # Local agent tooling (personal environment, not project config)
 .atl/
+
+# Python envs and local secrets / state
+.venv/
+.env.local
+.fleet/
