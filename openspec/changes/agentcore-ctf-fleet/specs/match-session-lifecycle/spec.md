@@ -84,6 +84,11 @@ A session with a running match MUST NOT start a second match. A `start` with the
 - WHEN `start` is invoked again on S
 - THEN it returns `already_running` (same `match_id` and `name`) or `rejected` (a different pair) and the running match is unaffected
 
+#### Scenario: Preflight does not block status or stop
+- GIVEN a `start` whose preflight (SSM, token) is still in progress
+- WHEN `status` or `stop` is invoked on S
+- THEN each returns promptly (`running` and `stopping` respectively; there is no separate `starting` status), a second `start` follows the guard above, and a `stop` ends in `stopped` without registering an async task
+
 #### Scenario: Restart after finish
 - GIVEN the match on S finished or was stopped
 - WHEN `start` is invoked on S

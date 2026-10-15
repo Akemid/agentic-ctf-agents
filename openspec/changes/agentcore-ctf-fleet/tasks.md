@@ -46,15 +46,17 @@ Legend: `[x]` done, `[~]` prepared - awaiting user execution (AWS-mutating or GP
 
 ## Phase 1: Slice 1 - scaffold, ctf_common, harness_sdk (PR 1)
 
-- [ ] 1.1 Root `pyproject.toml`: uv dev group (pytest, pytest-asyncio, httpx, fastapi, boto3 stubs), Python per S2. Verify `uv run --with pytest pytest` collects.
-- [ ] 1.2 RED `tests/test_payload.py` (payload scenarios: defaults, unwrap `{"prompt"}`, reject messages/unknown keys/multi-character, regex limits). 1.3 GREEN `shared/ctf_common/payload.py`.
-- [ ] 1.4 RED `tests/test_runner.py` (fake app/PlayFn: double start, already_running/rejected, status, stop, preflight FAILED, finally complete_async_task). 1.5 GREEN `shared/ctf_common/runner.py`.
-- [ ] 1.6 RED `tests/test_config.py` (SSM Stubber, missing param named in error, local overrides). 1.7 GREEN `config.py`.
-- [ ] 1.8 RED `tests/test_auth_mcp.py` (N tool calls = 1 token; reconnect = +1; no secret logging; 401 -> failed). 1.9 GREEN `auth.py`, `mcp.py`.
-- [ ] 1.10 Characterization tests then `prompts.py`, `hooks.py` extracted from `../amazingplayer-python/agent/refined/` sources.
-- [ ] 1.11 RED `tests/test_vendor_sync.py` (hash drift), GREEN `scripts/sync_common.py` (+`--check`); commit vendored copies.
-- [ ] 1.12 Port `app/harness_sdk/` (`harness_sdk/sdk_agent.py`, thin `main.py`, pyproject; delete `mcp_client/`, `model/`) with fake-MCP play-loop test.
-- [ ] 1.13 Docs: short `shared/ctf_common/README.md`. 1.14 Verify: full pytest green. 1.15 Blog-notes append (path above).
+Sources to port from now live in this repo: `local/agent/refined/` and `local/agent/_client.py` (git subtree). `local/` is NOT modified in this phase.
+
+- [x] 1.1 Root `pyproject.toml`: uv dev group (pytest, pytest-asyncio, httpx, fastapi, boto3 stubs, plus strands-agents/bedrock-agentcore/mcp), Python per S2 (`.python-version` 3.14). Verify `uv run --with pytest pytest` collects.
+- [x] 1.2 RED `tests/test_payload.py` (payload scenarios: defaults, unwrap `{"prompt"}`, reject messages/unknown keys/multi-character, regex limits). [x] 1.3 GREEN `shared/ctf_common/payload.py`.
+- [x] 1.4 RED `tests/test_runner.py` (fake app/PlayFn: double start, already_running/rejected, status, stop, preflight FAILED, finally complete_async_task). [x] 1.5 GREEN `shared/ctf_common/runner.py`.
+- [x] 1.6 RED `tests/test_config.py` (SSM Stubber, missing param named in error, local overrides). [x] 1.7 GREEN `config.py`.
+- [x] 1.8 RED `tests/test_auth_mcp.py` (N tool calls = 1 token; reconnect = +1; no secret logging; 401 -> failed). [x] 1.9 GREEN `auth.py`, `mcp.py`.
+- [x] 1.10 Characterization tests then `prompts.py`, `hooks.py` extracted from `local/agent/refined/harness_sdk.py` (adds `StopRequestedHook`, `TickCounterHook`).
+- [x] 1.11 RED `tests/test_vendor_sync.py` (hash drift), GREEN `scripts/sync_common.py` (+`--check`); commit vendored copies.
+- [x] 1.12 Port `app/harness_sdk/` (`sdk_agent.py`, thin `main.py`, pyproject; delete `mcp_client/`, `model/`, template `skills/`) with fake-MCP play-loop test.
+- [x] 1.13 Docs: short `shared/ctf_common/README.md`. [x] 1.14 Verify: full pytest green. [x] 1.15 Blog-notes append (path above).
 
 ## Phase 2: Slice 2 - remaining ports, decider client (PR 2)
 
@@ -64,6 +66,7 @@ Legend: `[x]` done, `[~]` prepared - awaiting user execution (AWS-mutating or GP
 - [ ] 2.5 Port `app/strand_decider/gate.py` (remove fcntl lock); test gate with fake decider.
 - [ ] 2.6 Re-run `sync_common.py`; `--check` green. 2.7 Verify: pytest green, no torch in any pyproject.
 - [ ] 2.8 Blog-notes append (path above).
+- [ ] 2.9 Follow-up (own PR if it exceeds budget): make `local/agent/refined/` consume `shared/ctf_common` (prompts, hooks, payload/option parsing, decider question builders) instead of its own copies, so the original and the deployed ports cannot drift. Keep `cd local && python -m unittest discover -s tests` green and add a guard test that fails if `local/` re-defines a shared symbol. Do not change local CLI behavior.
 
 ## Phase 3: Slice 3 - infra/decider (PR 3)
 
@@ -85,3 +88,5 @@ Legend: `[x]` done, `[~]` prepared - awaiting user execution (AWS-mutating or GP
 - [ ] 4.5 `docs/workshop-runbook.md`: deploy order, teardown, Budget, cost warning.
 - [ ] 4.6 E2E acceptance (manual): deploy per runbook, play a real match with all 4 types, verify tokens = MCP connections, teardown, `list-endpoints` empty.
 - [ ] 4.7 Blog-notes append (path above).
+
+> Review fixes (judgment-day round 1) applied to Phase 1 code: see `apply-progress.md` "Review fixes". No task status changed.
