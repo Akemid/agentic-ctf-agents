@@ -1,7 +1,9 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { Stack } from 'aws-cdk-lib';
+import { Template } from 'aws-cdk-lib/assertions';
 import * as iam from 'aws-cdk-lib/aws-iam';
-import { adaptEnvironments, FLEET, wireFleet, type RuntimeEnvLike } from '../lib/fleet-wiring';
+import { adaptEnvironments, FLEET, publishRuntimeArns, wireFleet, type RuntimeEnvLike } from '../lib/fleet-wiring';
 
 const ACCOUNT = '000000000000';
 const REGION = 'us-east-2';
@@ -10,7 +12,10 @@ const PROPS = { account: ACCOUNT, region: REGION };
 class RecordingEnv implements RuntimeEnvLike {
   readonly env: Record<string, string> = {};
   readonly statements: Array<ReturnType<iam.PolicyStatement['toStatementJson']>> = [];
-  constructor(readonly agentName: string) {}
+  readonly runtimeArn: string;
+  constructor(readonly agentName: string) {
+    this.runtimeArn = `arn:aws:bedrock-agentcore:${REGION}:${ACCOUNT}:runtime/${agentName}-AbC123`;
+  }
   addEnvironmentVariable(key: string, value: string): void {
     this.env[key] = value;
   }
@@ -189,6 +194,7 @@ describe('adaptEnvironments', () => {
         {
           agent: { name: n },
           runtime: {
+            runtimeArn: `arn:aws:bedrock-agentcore:${REGION}:${ACCOUNT}:runtime/${n}-XyZ789`,
             addEnvironmentVariable: (k: string, v: string) => calls.push([n, k, v]),
             addToPolicy: (s: iam.PolicyStatement) => policies.push([n, s]),
           },
@@ -203,6 +209,13 @@ describe('adaptEnvironments', () => {
     expect(adaptEnvironments(app).map(e => e.agentName)).toEqual(NAMES);
   });
 
+  test('maps the L3 runtime ARN of each environment', () => {
+    const { app } = fakeApp();
+    expect(adaptEnvironments(app).map(e => e.runtimeArn)).toEqual(
+      NAMES.map(n => `arn:aws:bedrock-agentcore:${REGION}:${ACCOUNT}:runtime/${n}-XyZ789`)
+    );
+  });
+
   test('forwards variables and statements to the right runtime', () => {
     const { app, calls, policies } = fakeApp();
     wireFleet(adaptEnvironments(app), PROPS);
@@ -211,5 +224,52 @@ describe('adaptEnvironments', () => {
     ]);
     expect(policies.filter(([n]) => n === 'harness')).toHaveLength(1);
     expect(policies.filter(([n]) => n === 'strand_decider')).toHaveLength(2);
+  });
+});
+
+describe('publishRuntimeArns', () => {
+  function publish(members?: typeof FLEET) {
+    const stack = new Stack(undefined, 'Pub', { env: { account: ACCOUNT, region: REGION } });
+    const envs = (members ? members.map(m => m.runtime) : NAMES).map(n => new RecordingEnv(n));
+    publishRuntimeArns(stack, envs, members ? { members } : undefined);
+    return { stack, template: Template.fromStack(stack), envs };
+  }
+
+  test('creates one String parameter per runtime under /ctfagents/runtimes/<runtime>/arn', () => {
+    const { template } = publish();
+    template.resourceCountIs('AWS::SSM::Parameter', 4);
+    for (const name of NAMES) {
+      template.hasResourceProperties('AWS::SSM::Parameter', {
+        Name: `/ctfagents/runtimes/${name}/arn`,
+        Type: 'String',
+        Value: `arn:aws:bedrock-agentcore:${REGION}:${ACCOUNT}:runtime/${name}-AbC123`,
+      });
+    }
+  });
+
+  test('the value is the runtime ARN itself (what InvokeAgentRuntime takes), not an id or an endpoint', () => {
+    const { template } = publish();
+    for (const p of Object.values(template.findResources('AWS::SSM::Parameter'))) {
+      expect(String(p.Properties.Value)).toMatch(/^arn:aws:bedrock-agentcore:[^:]+:\d{12}:runtime\/[^/]+$/);
+    }
+  });
+
+  test('adds no outputs, exports or imports', () => {
+    const { template } = publish();
+    const json = template.toJSON();
+    expect(json.Outputs ?? {}).toEqual({});
+    expect(JSON.stringify(json)).not.toContain('Fn::ImportValue');
+  });
+
+  test('narrowed members publish only their own runtime', () => {
+    const { template } = publish([FLEET[1]]);
+    template.resourceCountIs('AWS::SSM::Parameter', 1);
+    template.hasResourceProperties('AWS::SSM::Parameter', { Name: '/ctfagents/runtimes/harness_sdk/arn' });
+  });
+
+  test('validates like wireFleet: an environment outside the fleet table is an error', () => {
+    const stack = new Stack(undefined, 'Bad');
+    const envs = [...NAMES, 'surprise'].map(n => new RecordingEnv(n));
+    expect(() => publishRuntimeArns(stack, envs)).toThrow(/surprise/);
   });
 });
