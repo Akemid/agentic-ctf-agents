@@ -172,6 +172,19 @@ The synthesized stack gives each runtime its environment (`CTF_*`, parameter nam
 parameter `/ctf-decider/endpoint-name` and `sagemaker:InvokeEndpoint` on the `ctf-decider` endpoint.
 `agentcore/.cli/deployed-state.json` is local and gitignored; the launcher reads the runtime ARNs from it.
 
+The stack also publishes each runtime ARN as a plain SSM String parameter (no CloudFormation export):
+
+```bash
+for r in harness harness_sdk strand_decider decider_loop; do
+  aws ssm get-parameter --name "/ctfagents/runtimes/$r/arn" --query Parameter.Value --output text
+done
+```
+
+The value is the runtime ARN that `InvokeAgentRuntime` takes (default endpoint). `fleet.py` falls back to these
+parameters when `deployed-state.json` has no ARN for a runtime (it needs `ssm:GetParameters` on
+`/ctfagents/runtimes/*`; `--region` picks the SSM region), and so can any caller that is not on this machine,
+such as the web lobby.
+
 Note: the L3 grants `GetResourceOauth2Token` on `token-vault/*` to every runtime role, so a runtime uses only
 its own credential by convention, not because IAM forbids the others.
 
@@ -190,6 +203,23 @@ uv run python scripts/fleet.py start --match <match-id> \
 Each character has its own session (id of 33+ characters) and its own MCP session, with unique names such as
 `decider-loop-2`. A failed start does not stop the others; the command exits 1 and names the failures. Sessions
 are recorded in `.fleet/<match-id>.json` (gitignored). Add `--teams 1` to put every character on one team.
+
+### Waking one agent into an exact seat (what the web lobby does)
+
+```bash
+uv run python scripts/fleet.py start --match <match-id> --agent decider_loop=1 --team red --agent-index 1 --yes
+#   decider-loop-red-2: ok (started) team red agent_index 1
+```
+
+`--agent-index N` (0..2, the same name and range as the server's `join_match`; `--slot` is an equivalent option,
+the web lobby's key) needs `--team red|blue` and exactly one character; it names the character
+`<runtime>-<team>-<agent_index+1>`. The payload key is `agent_index`; the runtimes also accept `slot` (equal values
+are fine, different values are `rejected`) and `started` echoes both. `start` is synchronous up to the seat: the runtime calls `join_match`
+before it answers, so `started` means the character is seated in that exact seat, and the printed team and
+agent_index are what the server assigned. A refused seat is a failed start (exit 1) with the reason, for example
+`join_match failed: slot_taken`; the runtime never falls back to another seat. After a refusal the runner is restartable at once (an immediate retry on another seat works). A start can therefore take up
+to 15 s to answer (30 s for `harness`, whose model has to call `join_match` itself). See
+`openspec/changes/agentcore-ctf-fleet/lobby-wake.md`.
 
 ## 8. Play and monitor
 
@@ -246,7 +276,10 @@ aws sagemaker list-endpoints --query 'Endpoints[].EndpointName' --output text   
 | `hydrate_credentials.py` names an agent and an SSM path | the game stack does not publish that agent | deploy or fix the agentic-ctf stack; check `FLEET` in `scripts/fleet_config.py` |
 | `discovery URL drift` | the Cognito pool was recreated | confirm, then `--update-discovery-url` and redeploy (step 5) |
 | the deploy printed `Skipped <provider>` | the credentials were not hydrated | never deploy by hand; use `make deploy YES=1` |
-| `fleet.py` says no runtime ARN | `agentcore deploy` has not run on this machine | deploy, or pass `--runtime-arn RUNTIME=ARN` |
+| `fleet.py` says no runtime ARN | `agentcore deploy` has not run on this machine and SSM has no `/ctfagents/runtimes/<runtime>/arn` | deploy, or pass `--runtime-arn RUNTIME=ARN` |
+| a start is `rejected` with `join_match failed: slot_taken` (or `match_full`, `match_already_started`) | the seat is taken, the team is full or the match began | pick another `--agent-index`/`--team`; nothing was seated |
+| a start fails with `join_match timed out` | the server or the model did not answer within the join timeout | check the MCP URL and the server; retry with a NEW session id (the old session stays HealthyBusy until its thread exits, bounded by the MCP HTTP read timeout of about 300 s; `StopRuntimeSession` forces the recovery) |
+| `InvokeAgentRuntime` says `AccessDenied` for a caller that sends `runtimeUserId` | the role has `InvokeAgentRuntime` but not `InvokeAgentRuntimeForUser` | add `bedrock-agentcore:InvokeAgentRuntimeForUser` on the runtime and `runtime-endpoint/*` |
 | a start reply says `rejected` with an SSM message | the MCP URL or decider parameter is missing | check steps 1 and 4 |
 | decider runtimes fall back to the LLM | endpoint not `InService`, throttled or over its latency budget | check the endpoint status and the runtime logs |
 | `cdk deploy` of the decider refuses to run | no `IMAGE_TAG` (intentional guard) | pass the tag printed by `make build-image` |
