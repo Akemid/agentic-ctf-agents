@@ -458,6 +458,48 @@ class TestErrorMap:
         rig.clock.advance(2)
         assert rig.decider.breaker.state == "half_open"
 
+    def test_a_missing_endpoint_is_a_misconfiguration_not_a_retried_transient_failure(self, caplog):
+        """sagemaker-runtime answers a non-existent endpoint with ValidationError, HTTP 400."""
+        rig = Rig()
+        rig.stubber.add_client_error(
+            "invoke_endpoint",
+            service_error_code="ValidationError",
+            service_message=f"Endpoint {ENDPOINT} of account 123456789012 not found.",
+            http_status_code=400,
+        )
+        with caplog.at_level(logging.INFO, logger="ctf_common.decider"):
+            with pytest.raises(DeciderMisconfigured) as info:
+                rig.decider.ask("S", QUESTIONS)
+        assert isinstance(info.value, ServerUnavailable)
+        rig.stubber.assert_no_pending_responses()  # exactly one call: no retry burned the tick budget
+        assert rig.decider.breaker.state == "open"
+        rig.clock.advance(299)
+        assert rig.decider.breaker.state == "open"
+        rig.clock.advance(2)
+        assert rig.decider.breaker.state == "half_open"
+        unavailable = [r for r in caplog.records if "playing on the LLM fallback" in r.getMessage()]
+        assert len(unavailable) == 1 and unavailable[0].levelno == logging.INFO
+
+    def test_the_unavailable_notice_is_logged_once_per_outage_not_on_every_probe(self, caplog):
+        rig = Rig()
+        for _ in range(2):
+            rig.fail("ValidationError", 400)
+        with caplog.at_level(logging.INFO, logger="ctf_common.decider"):
+            with pytest.raises(DeciderMisconfigured):
+                rig.decider.ask("S", QUESTIONS)
+            rig.clock.advance(301)
+            with pytest.raises(DeciderMisconfigured):  # the re-probe fails too
+                rig.decider.ask("S", QUESTIONS)
+            rig.clock.advance(301)
+            rig.respond()
+            rig.decider.ask("S", QUESTIONS)  # recovered
+            rig.fail("ValidationError", 400)
+            rig.clock.advance(1)
+            with pytest.raises(DeciderMisconfigured):  # a NEW outage is announced again
+                rig.decider.ask("S", QUESTIONS)
+        notices = [r for r in caplog.records if "playing on the LLM fallback" in r.getMessage()]
+        assert len(notices) == 2
+
     @pytest.mark.parametrize(
         "error,expected",
         [

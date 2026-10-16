@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 from strands.interventions import Guide, Proceed
+from test_decider_client import Rig
 
 import gate
 from ctf_common.decider import DeciderCircuitOpen, DeciderTimeout, ServerUnavailable
@@ -143,6 +144,47 @@ class TestDeciderUnavailable:
 
     def test_unavailable_is_the_common_base_of_decider_failures(self):
         assert issubclass(DeciderTimeout, ServerUnavailable)
+
+
+class TestEndpointMissing:
+    """The decider is optional: with no endpoint, the real guarded client never blocks a tool call."""
+
+    def missing_endpoint(self, rig):
+        rig.stubber.add_client_error(
+            "invoke_endpoint",
+            service_error_code="ValidationError",
+            service_message="Endpoint ctf-decider of account 123456789012 not found.",
+            http_status_code=400,
+        )
+
+    def test_tag_and_grab_flag_proceed_ungated_and_the_match_continues(self):
+        rig = Rig()
+        self.missing_endpoint(rig)
+        reviewer = gate.ToolCallReviewer(rig.decider)
+        first = reviewer.before_tool_call(event("ctf-game_tag"))
+        assert isinstance(first, Proceed) and first.reason == "decider unavailable"
+        for tool in ("ctf-game_grab_flag", "ctf-game_tag", "ctf-game_move"):  # breaker open: no more calls
+            assert isinstance(reviewer.before_tool_call(event(tool)), Proceed)
+        rig.stubber.assert_no_pending_responses()  # the endpoint was called exactly once
+
+    def test_the_gate_picks_the_endpoint_up_again_after_the_breaker_window(self):
+        rig = Rig()
+        self.missing_endpoint(rig)
+        reviewer = gate.ToolCallReviewer(rig.decider)
+        assert isinstance(reviewer.before_tool_call(event()), Proceed)
+        rig.respond(
+            {
+                "answers": {
+                    "args_grounded": {"type": "noul", "noul": 0.1},
+                    "stale_state": {"type": "noul", "noul": 0.1},
+                }
+            }
+        )
+        rig.clock.advance(299)
+        assert isinstance(reviewer.before_tool_call(event()), Proceed)  # still open: not asked
+        rig.clock.advance(2)
+        assert isinstance(reviewer.before_tool_call(event()), Guide)  # re-probe answered: gated again
+        rig.stubber.assert_no_pending_responses()
 
 
 class RawDecider:

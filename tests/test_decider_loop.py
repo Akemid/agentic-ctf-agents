@@ -6,6 +6,7 @@ import threading
 
 import httpx
 import pytest
+from test_decider_client import Rig
 
 import loop
 import loop_logic as logic
@@ -357,6 +358,51 @@ class TestFallback:
             game2, make_ctx(options={"threshold": 0.7, "llm_budget_ms": 100})[0], decider, model
         )  # 0.6 < 0.7
         assert actions(game2, "move")[0]["direction"] == "down"
+
+
+class TestEndpointMissing:
+    """The decider is optional: with no endpoint the loop plays on the LLM, then re-probes."""
+
+    def decider_answer(self):
+        return {
+            "answers": {
+                "action": {
+                    "type": "choice",
+                    "choice": "move_up",
+                    "probabilities": {"move_up": 0.9},
+                    "confidence": 0.95,
+                },
+                "threat": {"type": "noul", "noul": 0.0},
+                "route_bad": {"type": "noul", "noul": 0.0},
+            }
+        }
+
+    def test_warm_up_failure_is_logged_ticks_use_the_llm_and_the_endpoint_is_re_probed(self, caplog):
+        rig = Rig()
+        rig.stubber.add_client_error(  # the warm-up: the endpoint does not exist
+            "invoke_endpoint",
+            service_error_code="ValidationError",
+            service_message="Endpoint ctf-decider of account 123456789012 not found.",
+            http_status_code=400,
+        )
+        rig.respond(self.decider_answer())  # the re-probe on tick 3: the endpoint is up now
+        rig.respond(self.decider_answer())  # tick 4
+        game = FakeGame(turns=4, state=STATE)
+        model = SequencePlayer([("move", {"tick": t, "direction": "down"}) for t in (1, 2)])
+
+        def on_tick(n):
+            if n == 3:
+                rig.clock.advance(301)  # the 300 s misconfiguration window has passed
+
+        ctx, _ = make_ctx(options={"llm_budget_ms": 100}, on_tick=on_tick)
+        with caplog.at_level(logging.INFO):
+            play_against(game, ctx, rig.decider, model)
+        directions = [m["direction"] for m in actions(game, "move")]
+        assert directions == ["down", "down", "up", "up"]  # LLM while the breaker is open, then the decider
+        assert len(model.calls) == 2
+        assert "decider warm-up failed (DeciderMisconfigured)" in caplog.text
+        assert caplog.text.count("decider unavailable (DeciderCircuitOpen)") == 2
+        rig.stubber.assert_no_pending_responses()  # one failed call, then exactly two answered ones
 
 
 class TestStop:
