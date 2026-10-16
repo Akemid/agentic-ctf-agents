@@ -26,6 +26,36 @@ PINNED_MODEL = re.search(r"DEFAULT_MODEL_ID = '([^']+)'", (DECIDER / "lib" / "na
 PYTHON_BASE = "public.ecr.aws/docker/library/python"
 BASE_PATTERN = re.escape(PYTHON_BASE) + r":3\.1[1-9]\.\d+-slim-\w+@sha256:[0-9a-f]{64}$"
 TORCH_INDEX = re.compile(r"--index-url https://download\.pytorch\.org/whl/cu12\d\b")
+LOCK = ADAPTER / "requirements.lock"
+LOCK_SOURCE = ADAPTER / "requirements.in"
+TORCH_LOCK = ADAPTER / "torch.lock"
+
+
+def lock_pins():
+    """{normalized name: version} of every pinned entry in requirements.lock."""
+    pins = {}
+    for line in LOCK.read_text().splitlines():
+        match = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==(\S+?)(?: \\)?$", line)
+        if match:
+            pins[match.group(1).lower().replace("_", "-")] = match.group(2)
+    return pins
+
+
+def lock_entries():
+    """{name: [lines of its block]}: each entry is its pin line plus the continuation lines that follow."""
+    entries, current = {}, None
+    for line in LOCK.read_text().splitlines():
+        match = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==", line)
+        if match:
+            current = match.group(1)
+            entries[current] = []
+        if current:
+            entries[current].append(line)
+    return entries
+
+
+def version_tuple(version):
+    return tuple(int(part) for part in re.match(r"\d+(?:\.\d+)*", version).group(0).split("."))
 
 
 def base_line(lines):
@@ -71,19 +101,115 @@ class TestProductionDockerfile:
         for name in ("Dockerfile", "Dockerfile.local"):
             assert "syntax=" not in (ADAPTER / name).read_text(), name
 
-    def test_installs_torch_2_7_1_from_a_cuda_12_wheel_index(self):
-        installs = [line for line in self.lines if "pip install" in line and '"torch==' in line]
-        assert len(installs) == 1
-        assert re.search(r'"torch==2\.7\.1"', installs[0])
-        assert TORCH_INDEX.search(installs[0]), installs[0]  # cu12x: a default PyPI pull may be CUDA 13
-
-    def test_torch_is_installed_before_everything_else_and_pip_may_not_replace_it(self):
+    def test_installs_torch_first_and_alone_from_a_cuda_12_wheel_index_at_the_locked_version(self):
         installs = [line for line in self.lines if "pip install" in line]
-        assert '"torch==' in installs[0]
+        first = installs[0]
+        assert TORCH_INDEX.search(first), first  # cu12x: a default PyPI pull may be CUDA 13
+        assert "--no-deps" in first  # its nvidia-* libraries come from the lock, hash-checked
+        assert "--require-hashes" in first  # pip skips torch's entry in the main lock: verify it here
+        assert re.search(r"(-r|--requirement) /tmp/torch\.lock\b", first), first
+        assert not re.findall(r'"[^"]+"', first), first
+        pin = TORCH_LOCK.read_text().splitlines()[0]
+        assert pin.startswith(f"torch=={lock_pins()['torch']} "), pin
+        assert re.search(r"\+cu12\d ", pin)
+
+    def test_the_torch_first_file_carries_exactly_the_torch_hashes_of_the_lock(self):
+        def hashes(lines):
+            return sorted(re.findall(r"--hash=sha256:([0-9a-f]{64})", "\n".join(lines)))
+
+        assert hashes(TORCH_LOCK.read_text().splitlines()) == hashes(lock_entries()["torch"])
+        assert hashes(lock_entries()["torch"])
+        assert TORCH_LOCK.read_text().count("==") == 1  # a single requirement
+        copy_at = next(
+            i for i, line in enumerate(self.lines) if line.startswith("COPY ") and "torch.lock" in line
+        )
+        first_install = next(i for i, line in enumerate(self.lines) if "pip install" in line)
+        assert copy_at < first_install
+
+    def test_every_other_install_reads_the_hash_locked_requirements_and_nothing_inline(self):
+        installs = [line for line in self.lines if "pip install" in line]
+        assert len(installs) == 2
         for line in installs[1:]:
-            assert re.search(r"(-c|--constraint) \S+", line), line
-            assert "torch==2.7.1+cu12" in " ".join(self.lines)  # the constraint names the local version
+            assert "--require-hashes" in line, line
+            assert "--no-deps" in line, line  # the lock is the full closure: nothing resolved at build time
+            assert re.search(r"(-r|--requirement) /tmp/requirements\.lock\b", line), line
+            assert not re.findall(r'"[^"]+"', line), line  # no inline requirement bypassing the lock
+        copy_at = next(i for i, line in enumerate(self.lines) if line.startswith("COPY requirements.lock "))
+        install_at = next(i for i, line in enumerate(self.lines) if "--require-hashes" in line)
+        assert copy_at < install_at
+        inline = r"(strands-decider|transformers|fastapi|uvicorn|httpx)=="
+        assert not any(re.search(inline, line) for line in self.lines)
+
+    def test_the_locked_install_uses_the_same_indexes_the_lock_was_compiled_with(self):
+        lock_install = next(line for line in self.lines if "/tmp/requirements.lock" in line and "pip" in line)
+        assert "--index-url https://pypi.org/simple" in lock_install
+        assert re.search(r"--extra-index-url https://download\.pytorch\.org/whl/cu12\d\b", lock_install)
+        header = LOCK_SOURCE.read_text()
+        assert "--index-url https://pypi.org/simple" in header
+        assert re.search(r"--extra-index-url https://download\.pytorch\.org/whl/cu12\d\b", header)
+
+    def test_torch_is_installed_before_everything_else_and_never_from_a_cuda_13_or_nightly_index(self):
+        installs = [line for line in self.lines if "pip install" in line]
+        assert "/tmp/torch.lock" in installs[0]
         assert not any("whl/cu13" in line or "whl/nightly" in line for line in self.lines)
+
+    def test_the_lock_pins_every_package_with_a_hash(self):
+        entries = lock_entries()
+        assert entries
+        for name, block in entries.items():
+            assert re.match(rf"^{re.escape(name)}==\S+ \\$", block[0]), name
+            assert any("--hash=sha256:" in line for line in block), name
+
+    def test_the_lock_holds_the_runtime_dependencies_on_a_cuda_12_torch(self):
+        pins = lock_pins()
+        for name in (
+            "torch",
+            "transformers",
+            "strands-decider",
+            "peft",
+            "accelerate",
+            "safetensors",
+            "tokenizers",
+            "huggingface-hub",
+            "fastapi",
+            "uvicorn",
+            "httpx",
+        ):
+            assert name in pins, name
+        assert re.search(r"\+cu12\d$", pins["torch"]), pins["torch"]
+        assert pins["strands-decider"] == "0.1.0"
+
+    def test_the_lock_has_no_cuda_13_or_cpu_wheels(self):
+        text = LOCK.read_text()
+        assert not re.search(r"cu13\d|\+cpu", text)
+        assert all(name.endswith("-cu12") for name in lock_pins() if name.startswith("nvidia-"))
+
+    def test_the_locked_versions_satisfy_what_strands_decider_asks_for(self):
+        pins = lock_pins()
+        # torch.distributed.checkpoint.hf_storage first ships in 2.8
+        assert version_tuple(pins["torch"]) >= (2, 8)
+        assert (5, 15) <= version_tuple(pins["transformers"]) < (6,)
+        assert version_tuple(pins["peft"]) >= (0, 21)
+        assert version_tuple(pins["huggingface-hub"]) >= (1, 5)
+
+    def test_the_lock_source_pins_the_same_torch_as_the_lock(self):
+        source = LOCK_SOURCE.read_text()
+        assert f"torch=={lock_pins()['torch']}" in source
+        assert f"transformers=={lock_pins()['transformers']}" in source
+
+    def test_a_smoke_import_runs_last_after_the_installs_the_bake_and_the_offline_switch(self):
+        runs = [i for i, line in enumerate(self.lines) if line.startswith("RUN ")]
+        smoke_at = next(i for i, line in enumerate(self.lines) if "adapter.smoke" in line)
+        assert smoke_at == runs[-1]  # the last RUN
+        install_at = max(i for i, line in enumerate(self.lines) if "pip install" in line)
+        bake_at = next(i for i, line in enumerate(self.lines) if "adapter.bake" in line)
+        offline_at = next(i for i, line in enumerate(self.lines) if "HF_HUB_OFFLINE=1" in line)
+        assert install_at < bake_at < offline_at < smoke_at
+        assert self.lines[smoke_at].startswith("RUN python -m adapter.smoke")
+
+    def test_the_image_smoke_is_strict_so_codebuild_can_never_skip_the_meta_device_build(self):
+        smoke_line = next(line for line in self.lines if "adapter.smoke" in line)
+        assert "--require-checkpoint" in smoke_line
 
     def test_has_no_dlc_leftovers(self):
         text = (ADAPTER / "Dockerfile").read_text()
@@ -94,17 +220,6 @@ class TestProductionDockerfile:
         cmd = [line for line in self.lines if line.startswith("CMD ")]
         assert len(entrypoint) == 1
         assert len(cmd) == 1
-
-    def test_pins_every_pip_requirement(self):
-        installs = [line for line in self.lines if "pip install" in line]
-        assert installs
-        for line in installs:
-            requirements = re.findall(r'"([^"]+)"', line)
-            assert requirements
-            assert all("==" in requirement for requirement in requirements), line
-
-    def test_installs_strands_decider(self):
-        assert any('"strands-decider==' in line for line in self.lines)
 
     def test_does_not_bundle_nvidia_drivers(self):
         text = (ADAPTER / "Dockerfile").read_text().lower()
@@ -158,6 +273,197 @@ class TestLocalDockerfile:
     def test_pins_its_requirements(self):
         for line in (line for line in self.lines if "pip install" in line):
             assert all("==" in requirement for requirement in re.findall(r'"([^"]+)"', line)), line
+
+
+class FakeModules:
+    """Stands in for importlib.import_module: a dict of fake modules; missing names raise like an import."""
+
+    def __init__(self, **modules):
+        self.modules = modules
+        self.imported = []
+
+    def __call__(self, name):
+        self.imported.append(name)
+        if name not in self.modules:
+            raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+        return self.modules[name]
+
+
+def healthy_modules(**overrides):
+    from types import SimpleNamespace
+
+    names = [
+        "torch",
+        "transformers",
+        "strands_decider",
+        "peft",
+        "accelerate",
+        "huggingface_hub",
+        "safetensors",
+        "fastapi",
+        "uvicorn",
+        "httpx",
+    ]
+    modules = {name: SimpleNamespace(__version__="1.2.3") for name in names}
+    modules["transformers"] = SimpleNamespace(__version__="5.19.0", Qwen3_5ForCausalLM=object)
+    modules["strands_decider.modeling"] = SimpleNamespace(StrandsDeciderModel=object)
+    modules["torch.distributed.checkpoint.hf_storage"] = SimpleNamespace()
+    modules.update(overrides)
+    return FakeModules(**modules)
+
+
+class TestSmoke:
+    """`python -m adapter.smoke` is the last RUN of the image: a broken dependency set must fail the build."""
+
+    def run(self, imports, checkpoint=None, architecture=lambda directory: "Qwen3_5ForCausalLM"):
+        from adapter.smoke import smoke
+
+        lines = []
+        smoke(checkpoint, import_module=imports, load_architecture=architecture, report=lines.append)
+        return "\n".join(lines)
+
+    def test_imports_the_model_stack_and_prints_the_versions(self):
+        imports = healthy_modules()
+        out = self.run(imports)
+        for name in ("torch", "transformers", "strands_decider"):
+            assert name in imports.imported
+        assert "transformers 5.19.0" in out
+        assert "torch 1.2.3" in out
+
+    def test_resolves_the_model_class_the_decider_loads_without_weights(self):
+        imports = healthy_modules()
+        self.run(imports)
+        assert "torch.distributed.checkpoint.hf_storage" in imports.imported
+
+    def test_the_incident_fails_the_build_a_transformers_that_cannot_import_its_model_class(self):
+        from adapter.smoke import SmokeError
+
+        class Broken:
+            __version__ = "5.20.1"
+
+            def __getattr__(self, name):
+                raise ModuleNotFoundError("No module named 'torch.distributed.checkpoint.hf_storage'")
+
+        with pytest.raises(SmokeError, match="Qwen3_5ForCausalLM"):
+            self.run(healthy_modules(transformers=Broken()))
+
+    def test_a_torch_without_hf_storage_fails(self):
+        from adapter.smoke import SmokeError
+
+        imports = healthy_modules()
+        del imports.modules["torch.distributed.checkpoint.hf_storage"]
+        with pytest.raises(SmokeError, match="hf_storage"):
+            self.run(imports)
+
+    @pytest.mark.parametrize("missing", ["torch", "transformers", "strands_decider", "peft", "fastapi"])
+    def test_a_missing_package_fails_and_names_it(self, missing):
+        from adapter.smoke import SmokeError
+
+        imports = healthy_modules()
+        del imports.modules[missing]
+        with pytest.raises(SmokeError, match=missing):
+            self.run(imports)
+
+    def test_imports_the_module_the_decider_serve_path_uses_to_build_its_model(self):
+        imports = healthy_modules()
+        self.run(imports)
+        assert "strands_decider.modeling" in imports.imported
+
+    def test_a_decider_modeling_module_that_cannot_import_fails(self):
+        from adapter.smoke import SmokeError
+
+        imports = healthy_modules()
+        del imports.modules["strands_decider.modeling"]
+        with pytest.raises(SmokeError, match="strands_decider.modeling"):
+            self.run(imports)
+
+    def test_a_decider_modeling_module_without_the_model_class_fails(self):
+        from types import SimpleNamespace
+
+        from adapter.smoke import SmokeError
+
+        imports = healthy_modules(**{"strands_decider.modeling": SimpleNamespace()})
+        with pytest.raises(SmokeError, match="StrandsDeciderModel"):
+            self.run(imports)
+
+    def test_strict_mode_without_a_checkpoint_fails(self):
+        from adapter.smoke import SmokeError, smoke
+
+        with pytest.raises(SmokeError, match="checkpoint"):
+            smoke(None, require_checkpoint=True, import_module=healthy_modules(), report=lambda line: None)
+
+    def test_without_a_checkpoint_it_skips_the_config_check_but_still_checks_the_class(self):
+        out = self.run(healthy_modules(), checkpoint=None)
+        assert "skipped" in out
+
+    def test_with_a_checkpoint_the_architecture_is_resolved_from_its_config(self, tmp_path):
+        seen = []
+        out = self.run(
+            healthy_modules(),
+            checkpoint=tmp_path,
+            architecture=lambda directory: seen.append(directory) or "Qwen3_5ForCausalLM",
+        )
+        assert seen == [tmp_path]
+        assert "Qwen3_5ForCausalLM" in out
+
+    def test_an_architecture_the_installed_transformers_lacks_fails(self, tmp_path):
+        from adapter.smoke import SmokeError
+
+        with pytest.raises(SmokeError, match="Qwen9ForCausalLM"):
+            self.run(
+                healthy_modules(), checkpoint=tmp_path, architecture=lambda directory: "Qwen9ForCausalLM"
+            )
+
+    @pytest.mark.parametrize("how", ["flag", "env"])
+    def test_the_cli_in_strict_mode_exits_1_when_the_checkpoint_dir_is_unset(self, monkeypatch, capsys, how):
+        from adapter import smoke
+
+        monkeypatch.delenv("DECIDER_CHECKPOINT_DIR", raising=False)
+        monkeypatch.setattr(smoke, "smoke", lambda *a, **k: pytest.fail("must not run without a checkpoint"))
+        argv = ["--require-checkpoint"] if how == "flag" else []
+        if how == "env":
+            monkeypatch.setenv("SMOKE_REQUIRE_CHECKPOINT", "1")
+        assert smoke.main(argv) == 1
+        assert "checkpoint" in capsys.readouterr().err
+
+    def test_the_cli_in_strict_mode_exits_1_when_the_config_is_missing(self, monkeypatch, tmp_path, capsys):
+        from adapter import smoke
+
+        monkeypatch.setenv("DECIDER_CHECKPOINT_DIR", str(tmp_path))  # no strands_decider_config.json in it
+        monkeypatch.setattr(smoke, "smoke", lambda *a, **k: pytest.fail("must not run without a config"))
+        assert smoke.main(["--require-checkpoint"]) == 1
+        assert "strands_decider_config.json" in capsys.readouterr().err
+
+    def test_the_cli_in_strict_mode_passes_with_a_fake_checkpoint(self, monkeypatch, tmp_path, capsys):
+        from adapter import smoke
+
+        (tmp_path / "strands_decider_config.json").write_text("{}")
+        monkeypatch.setenv("DECIDER_CHECKPOINT_DIR", str(tmp_path))
+        seen = []
+        monkeypatch.setattr(smoke, "smoke", lambda checkpoint, **kwargs: seen.append((checkpoint, kwargs)))
+        assert smoke.main(["--require-checkpoint"]) == 0
+        assert seen[0][0] == tmp_path
+        assert "smoke check passed" in capsys.readouterr().out
+
+    def test_the_cli_without_strict_mode_still_runs_with_no_checkpoint(self, monkeypatch, capsys):
+        from adapter import smoke
+
+        monkeypatch.delenv("DECIDER_CHECKPOINT_DIR", raising=False)
+        monkeypatch.delenv("SMOKE_REQUIRE_CHECKPOINT", raising=False)
+        seen = []
+        monkeypatch.setattr(smoke, "smoke", lambda checkpoint, **kwargs: seen.append(checkpoint))
+        assert smoke.main([]) == 0
+        assert seen == [None]
+
+    def test_the_cli_returns_non_zero_when_the_stack_is_broken(self, monkeypatch, capsys):
+        from adapter import smoke
+
+        def boom(*args, **kwargs):
+            raise smoke.SmokeError("torch is broken")
+
+        monkeypatch.setattr(smoke, "smoke", boom)
+        assert smoke.main([]) == 1
+        assert "torch is broken" in capsys.readouterr().err
 
 
 class FakeHub:

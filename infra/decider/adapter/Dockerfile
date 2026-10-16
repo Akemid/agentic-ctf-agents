@@ -9,6 +9,7 @@
 # Refresh (read-only): docker buildx imagetools inspect public.ecr.aws/docker/library/python:3.11-slim-bookworm
 # The AWS Deep Learning Container was dropped: its 2.6 line is past end of patching, we reinstalled torch on top
 # of it, overrode its entrypoint and CMD, and mixed its CUDA 12.4 libraries with the wheel's. See the design addendum.
+# Dependencies: requirements.lock (hash-pinned) and the build-time smoke check; see decider-image-deps.md in the change.
 FROM --platform=linux/amd64 public.ecr.aws/docker/library/python:3.11.17-slim-bookworm@sha256:0a310eeecf4e1f5a0743f9a6520c90c88d089c903ca5fd283f501e3a805f5f89
 
 ARG MODEL_ID=StrandsAgents/strands-decider-2B-hobson-v21
@@ -22,17 +23,30 @@ ENV PYTHONUNBUFFERED=1 \
     HF_HOME=/opt/decider/hf \
     DECIDER_CHECKPOINT_DIR=/opt/decider/checkpoint
 
-# torch comes first, alone, from the CUDA 12.6 wheel index: 2.7.1 is published for cu118/cu126/cu128 (not cu124),
-# and cu126 is the oldest of them, closest to the driver-550 (CUDA 12.4) AMI, which runs it through CUDA 12.x
-# minor-version compatibility. The wheel bundles the CUDA runtime libraries; the host driver is mounted by SageMaker.
-# A pinned version from this index also keeps pip from taking the default PyPI wheel line, which moves to CUDA 13.
-RUN pip install --index-url https://download.pytorch.org/whl/cu126 "torch==2.7.1"
+# Every runtime dependency is pinned and hash-checked in requirements.lock (generated from requirements.in, see the
+# header there), the full closure for linux/amd64 + Python 3.11. Nothing is resolved at build time: an unpinned
+# transitive dependency is how the first image shipped a transformers that needs a newer torch than the one pinned.
+COPY requirements.lock torch.lock /tmp/
 
-# strands-decider needs torch>=2.7: the constraint makes pip keep the wheel above instead of replacing it.
-# The rest comes from PyPI.
-RUN printf 'torch==2.7.1+cu126\n' > /tmp/constraints.txt \
-    && pip install -c /tmp/constraints.txt "strands-decider==0.1.0" "fastapi==0.143.1" "uvicorn==0.54.0" "httpx==0.28.1" \
-    && rm /tmp/constraints.txt
+# torch comes first, alone, from the CUDA 12.6 wheel index. cu126 is the newest CUDA 12.x line for torch 2.14
+# (cu128 stops at 2.11, cu129 at 2.13), and 2.14.1 is the build the decider was validated with. The wheel bundles the
+# CUDA runtime; the SageMaker AMI mounts the host driver (550, CUDA 12.4), which runs CUDA 12.x wheels through
+# minor-version compatibility. CUDA 13 wheels need a newer driver, and the default PyPI wheel line is CUDA 13, so a
+# version pinned to the +cu126 build from this index is what keeps pip off it. --no-deps: the nvidia-* libraries
+# below come from the lock, with their hashes.
+# torch.lock is the torch entry of requirements.lock, verbatim (a test keeps them equal): pip skips that entry in the
+# main install because torch is already present, so this is the one place torch's wheel hash is verified.
+RUN pip install --require-hashes --no-deps --index-url https://download.pytorch.org/whl/cu126 \
+        -r /tmp/torch.lock
+
+# The rest of the lock. torch is already installed, so pip skips its entry; everything else is exact and hash-checked.
+# The same two indexes as the `uv pip compile` that wrote the lock: a few packages (triton among them) are published on
+# both with different file hashes, and pip keeps only the candidates whose hash is in the lock.
+# --only-binary: no source build may slip in. --no-deps: the lock is the whole closure, pip resolves nothing.
+RUN pip install --require-hashes --no-deps --only-binary=:all: \
+        --index-url https://pypi.org/simple --extra-index-url https://download.pytorch.org/whl/cu126 \
+        -r /tmp/requirements.lock \
+    && rm /tmp/requirements.lock /tmp/torch.lock
 
 WORKDIR /opt/decider
 COPY adapter /opt/decider/adapter
@@ -46,6 +60,11 @@ RUN MODEL_ID="${MODEL_ID}" MODEL_REVISION="${MODEL_REVISION}" BASE_MODEL_ID="${B
 ENV HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
     DECIDER_DTYPE=float16
+
+# Fail the BUILD, not the endpoint, when the dependency set does not work together. No GPU, no weights loaded: it
+# imports the model stack, resolves the checkpoint's architecture class and builds it on the meta device.
+# --require-checkpoint: a missing checkpoint fails the build instead of silently skipping that meta-device build.
+RUN python -m adapter.smoke --require-checkpoint
 
 EXPOSE 8080
 

@@ -34,14 +34,14 @@ describe('endpoint', () => {
 describe('endpoint config', () => {
   const template = synth();
 
-  test('runs one ml.g4dn.xlarge with a 1200 s startup health check', () => {
+  test('runs one ml.g4dn.xlarge with a 600 s startup health check', () => {
     template.hasResourceProperties('AWS::SageMaker::EndpointConfig', {
       ProductionVariants: [
         Match.objectLike({
           InstanceType: 'ml.g4dn.xlarge',
           InitialInstanceCount: 1,
           InitialVariantWeight: 1,
-          ContainerStartupHealthCheckTimeoutInSeconds: 1200,
+          ContainerStartupHealthCheckTimeoutInSeconds: 600,
           VariantName: 'AllTraffic',
         }),
       ],

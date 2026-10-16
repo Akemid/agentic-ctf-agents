@@ -43,7 +43,7 @@ class AdapterConfig:
     upstream_timeout_s: float = 10.0
     health_interval_s: float = 5.0
     health_failures: int = 3
-    startup_timeout_s: float = 1100.0
+    startup_timeout_s: float = 550.0
     warmup_timeout_s: float = 120.0
     drain_timeout_s: float = 30.0
     drain_poll_s: float = 0.5
