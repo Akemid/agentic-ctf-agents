@@ -30,7 +30,7 @@ make install                                         # npm ci
 CTF_BUDGET_EMAIL=<your-email> make deploy-persistent
 # whenever the adapter or the model changes (MUTATING: runs CodeBuild, pushes to ECR)
 make build-image YES=1                               # prints imageTag=<hash>
-# weekly: creates the GPU endpoint (BILLING); wait for InService (start-up timeout is 1200 s)
+# weekly: creates the GPU endpoint (BILLING); wait for InService (start-up timeout is 600 s)
 IMAGE_TAG=<hash> make deploy-decider
 # teardown: stops billing; ECR and the Budget stay. Needs no tag and no email
 make destroy-decider
@@ -96,7 +96,7 @@ All optional; invalid values stop the container at start-up.
 | `ADAPTER_UPSTREAM_TIMEOUT_S` | `10.0` | per-call timeout to the decider (504 `upstream_timeout`) |
 | `ADAPTER_HEALTH_INTERVAL_S` | `5.0` | seconds between idle health probes |
 | `ADAPTER_HEALTH_FAILURES` | `3` | consecutive idle soft failures before a restart |
-| `ADAPTER_STARTUP_TIMEOUT_S` | `1100.0` | longest wait for the first healthy `/health` (under the 1200 s endpoint start-up check) |
+| `ADAPTER_STARTUP_TIMEOUT_S` | `550.0` | longest wait for the first healthy `/health` (under the 600 s endpoint start-up check) |
 | `ADAPTER_WARMUP_TIMEOUT_S` | `120.0` | longest wait for the warm-up question |
 | `ADAPTER_DRAIN_TIMEOUT_S` | `30.0` | longest wait for the decider to go idle after a failed call, then it is restarted |
 | `ADAPTER_DRAIN_POLL_S` | `0.5` | seconds between `/health` polls while draining |
@@ -109,13 +109,36 @@ All optional; invalid values stop the container at start-up.
 no login and has no Docker Hub anonymous pull rate limit, so the buildspec logs in only to our own ECR repository
 and the CodeBuild role has no pull grant on any other repository. `Dockerfile.local` uses the same base.
 
-- torch: `torch==2.7.1` from the CUDA 12.6 wheel index (`https://download.pytorch.org/whl/cu126`), installed first
-  and alone. 2.7.1 is published for cu118, cu126 and cu128 only (no cu124); cu126 is the oldest of those, closest
-  to the driver-550 (CUDA 12.4) `al2-ami-sagemaker-inference-gpu-3-1` AMI, which runs it through CUDA 12.x
-  minor-version compatibility. The wheel bundles the CUDA runtime libraries; no NVIDIA driver is in the image.
-- A second `pip install` adds `strands-decider==0.1.0` and the adapter dependencies with a constraints file
-  (`torch==2.7.1+cu126`), so pip cannot replace torch (`strands-decider` needs `torch>=2.7`). Pinning the wheel
-  from a cu12x index also keeps a CUDA 13 wheel out.
+- Dependencies: `adapter/requirements.lock` is the full closure for linux/amd64 + Python 3.11, with a hash per file,
+  generated from `adapter/requirements.in` (the command is in its header, with `uv pip compile`). Nothing is
+  resolved at build time. `strands-decider==0.1.0` only asks for `torch>=2.7` and `transformers>=5.15,<6`; the first
+  image left everything else open, pip took the newest transformers, and its model code imports
+  `torch.distributed.checkpoint.hf_storage`, which torch 2.7.1 does not ship (it first appears in 2.8). The endpoint
+  never became healthy. Details: `openspec/changes/agentcore-ctf-fleet/decider-image-deps.md`.
+- torch: `torch==2.14.1+cu126` from the CUDA 12.6 wheel index (`https://download.pytorch.org/whl/cu126`), installed
+  first and alone (`--no-deps --require-hashes -r torch.lock`; `torch.lock` is the torch entry of `requirements.lock`,
+  verbatim, and a test keeps them equal, because pip skips torch's entry in the main install and would never verify its
+  hash). cu126 is the newest CUDA 12.x index for this line (cu128 stops at 2.11, cu129 at
+  2.13), and 2.14.1 plus `transformers==5.19.0` is the pair the decider was validated with locally. Driver check: the
+  `al2-ami-sagemaker-inference-gpu-3-1` AMI has NVIDIA driver 550 (CUDA 12.4). CUDA 12.x wheels run on it through
+  minor-version compatibility (any driver of the 12.x family, 525 or newer); CUDA 13 wheels need a newer driver and do
+  NOT start. The default PyPI torch wheel line is CUDA 13, hence the pinned `+cu126` build from this index. The wheel
+  bundles the CUDA runtime libraries; no NVIDIA driver is in the image. A T4 is sm_75, which cu126 builds include (torch 2.14
+  is the last release with CUDA 12 wheels; 2.15 drops Maxwell, Pascal and Volta and stops publishing cu126).
+- A second `pip install --require-hashes --no-deps --only-binary=:all: -r requirements.lock` installs the rest
+  (torch is already there and is skipped). `tests/test_adapter_build.py` fails if any dependency is installed outside
+  the lock, if the lock has an entry without a hash, a CUDA 13 or CPU wheel, or if torch is older than 2.8.
+- Build-time smoke check: the last `RUN` is `python -m adapter.smoke --require-checkpoint`
+  (strict: a missing checkpoint or config exits 1, so CodeBuild can never skip the meta-device build; without the flag
+  or `SMOKE_REQUIRE_CHECKPOINT=1` a local run only prints "skipped"). No GPU and no weights loaded: it imports
+  torch, transformers, peft, accelerate, strands_decider, fastapi and the rest, imports
+  `strands_decider.modeling` (the module `strands-decider serve` builds its model with),
+  `torch.distributed.checkpoint.hf_storage`, reads the baked checkpoint's `strands_decider_config.json`, resolves
+  the base model's `AutoConfig` from the offline cache, builds `Qwen3_5ForCausalLM` on the meta device (shapes only)
+  and prints the versions. A broken combination fails the CodeBuild build, not the endpoint.
+- To change a version: edit `requirements.in`, regenerate the lock, run `make test-adapter`. The tag is a content
+  hash of the adapter directory, so it changes; redeploy `CtfPersistentStack` (the CodeBuild source asset) before
+  `make build-image`.
 - No extra OS packages: the torch wheel bundles `libgomp`, and the slim image already has CA certificates.
   [UNVERIFIED on a GPU: the full image is not built locally.]
 - The ENTRYPOINT/CMD are ours (`["python", "-m", "adapter"]`, `["serve"]`), nothing to override.
