@@ -5,8 +5,8 @@ Separate CDK app for the SageMaker decider endpoint. `agentcore deploy` never to
 
 | Stack | Deploy | Contains |
 |---|---|---|
-| `CtfPersistentStack` | once | ECR repo `ctf-decider` (RETAIN, keep last 3), CodeBuild image builder, SageMaker Budget ($25/month, alerts at 80% actual and 100% forecast), SSM `/ctf-decider/repo-uri` and `/ctf-decider/build-project` |
-| `DeciderStack` | weekly | `ml.g4dn.xlarge` x1 endpoint `ctf-decider`, execution role, SSM `/ctf-decider/endpoint-name`. No exports |
+| `CtfPersistentStack` | once | ECR repo `ctf-decider` (RETAIN, keep last 3), CodeBuild image builder, SageMaker Budget ($25/month, alerts at 80% actual and 100% forecast), SSM `/ctf-decider/repo-uri`, `/ctf-decider/build-project` and `/ctf-decider/endpoint-name` (the constant `ctf-decider`, always present) |
+| `DeciderStack` | weekly | `ml.g4dn.xlarge` x1 endpoint `ctf-decider`, execution role. No SSM parameter, no exports |
 
 Both stacks are ALWAYS synthesized, with or without inputs. The inputs are only needed to DEPLOY:
 
@@ -20,6 +20,25 @@ can always stop the billing endpoint without remembering a tag. The placeholder 
 unusable image tag, an `.invalid` address) is inert, and the error annotation stops it from being deployed.
 (`cdk deploy --ignore-errors` would bypass the guard; do not use it.)
 
+## The decider is optional
+
+`/ctf-decider/endpoint-name` lives in `CtfPersistentStack` and does not depend on the endpoint, so the
+`strand_decider` and `decider_loop` runtimes always pass preflight, with or without `DeciderStack`. What they
+do depends on the endpoint:
+
+| Endpoint | Behaviour |
+|---|---|
+| up | the agents use it |
+| down (stack destroyed) | the first `invoke_endpoint` fails with `ValidationError` ("Endpoint ctf-decider of account ... not found"); the client treats it as a misconfiguration and opens its circuit breaker for 300 s. `strand_decider` proceeds ungated; `decider_loop` plays every tick on the LLM. One INFO line, "decider endpoint unavailable; playing on the LLM fallback", marks the start of the outage |
+| brought up mid-match | the next call after the 300 s window re-probes the endpoint; if it answers, the decider is used again. No restart needed |
+
+`make destroy-decider` leaves the parameter in place on purpose.
+
+**Deploy order.** The parameter used to belong to `DeciderStack`. A named SSM parameter cannot be owned by
+two stacks, so deploy `CtfPersistentStack` only while `DeciderStack` is destroyed (or destroy `DeciderStack`
+first). Otherwise CloudFormation fails with "parameter already exists". Once both are on the new templates the
+order no longer matters.
+
 ## Workflow
 
 Each `make` target below builds the TypeScript first and runs the CDK CLI, which asks for confirmation.
@@ -32,7 +51,7 @@ CTF_BUDGET_EMAIL=<your-email> make deploy-persistent
 make build-image YES=1                               # prints imageTag=<hash>
 # weekly: creates the GPU endpoint (BILLING); wait for InService (start-up timeout is 600 s)
 IMAGE_TAG=<hash> make deploy-decider
-# teardown: stops billing; ECR and the Budget stay. Needs no tag and no email
+# teardown: stops billing; ECR, the Budget and the endpoint-name parameter stay. Needs no tag and no email
 make destroy-decider
 ```
 
