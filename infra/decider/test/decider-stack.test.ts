@@ -178,12 +178,9 @@ describe('ordering', () => {
 describe('publication and isolation from the persistent stack', () => {
   const template = synth();
 
-  test('publishes the endpoint name to SSM', () => {
-    template.hasResourceProperties('AWS::SSM::Parameter', {
-      Name: '/ctf-decider/endpoint-name',
-      Type: 'String',
-      Value: 'ctf-decider',
-    });
+  test('does not create the endpoint-name SSM parameter (CtfPersistentStack owns it)', () => {
+    expect(Object.keys(template.findResources('AWS::SSM::Parameter'))).toHaveLength(0);
+    expect(JSON.stringify(template.toJSON())).not.toContain('/ctf-decider/endpoint-name');
   });
 
   test('has no Export in any Output', () => {

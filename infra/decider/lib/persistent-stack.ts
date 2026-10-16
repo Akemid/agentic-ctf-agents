@@ -6,7 +6,7 @@ import * as s3assets from 'aws-cdk-lib/aws-s3-assets';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
 import type { Construct } from 'constructs';
 import { resolveAdapterDir } from './paths';
-import { DEFAULT_MODEL_ID, REPOSITORY_NAME, SSM_BUILD_PROJECT, SSM_REPO_URI } from './names';
+import { DEFAULT_MODEL_ID, ENDPOINT_NAME, REPOSITORY_NAME, SSM_BUILD_PROJECT, SSM_ENDPOINT_NAME, SSM_REPO_URI } from './names';
 
 export interface CtfPersistentStackProps extends StackProps {
   /** Budget alert recipient. Falls back to context `budgetEmail`, then env CTF_BUDGET_EMAIL. */
@@ -25,7 +25,7 @@ export const KEEP_IMAGES = 3;
 
 /**
  * Deployed once; it survives the weekly teardown of DeciderStack.
- * Holds the image repository, the image builder and the cost alert.
+ * Holds the image repository, the image builder, the cost alert and the endpoint-name parameter.
  */
 export class CtfPersistentStack extends Stack {
   readonly repository: ecr.Repository;
@@ -126,6 +126,13 @@ export class CtfPersistentStack extends Stack {
       })),
     });
 
+    // Always present, whether or not DeciderStack is deployed: the agents read it at preflight. When the
+    // endpoint is down the first invoke fails and the guarded client falls back to the LLM. It must never
+    // depend on the Endpoint resource.
+    new ssm.StringParameter(this, 'EndpointNameParam', {
+      parameterName: SSM_ENDPOINT_NAME,
+      stringValue: ENDPOINT_NAME,
+    });
     new ssm.StringParameter(this, 'RepoUriParam', {
       parameterName: SSM_REPO_URI,
       stringValue: this.repository.repositoryUri,
