@@ -50,7 +50,7 @@ class TestConfig:
         assert defaults.health_failures == 3
         assert defaults.warmup_timeout_s == 120.0
         assert defaults.health_interval_s == 5.0
-        assert defaults.startup_timeout_s == 1100.0
+        assert defaults.startup_timeout_s == 550.0
         assert defaults.drain_timeout_s == 30.0
         assert defaults.drain_poll_s == 0.5
         config = AdapterConfig.from_env(

@@ -66,7 +66,7 @@ class Supervisor:
         busy: Callable[[], bool] | None = None,
         health_interval_s: float = 5.0,
         startup_poll_s: float = 1.0,
-        startup_timeout_s: float = 1100.0,
+        startup_timeout_s: float = 550.0,
         health_failures: int = 3,
         max_restarts: int = 1,
     ) -> None:

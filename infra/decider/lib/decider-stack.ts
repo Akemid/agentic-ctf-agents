@@ -21,7 +21,9 @@ export const PLACEHOLDER_IMAGE_TAG = 'placeholder-imagetag-required';
 export const ENDPOINT_METRICS_NAMESPACE = '/aws/sagemaker/Endpoints';
 
 export const INSTANCE_TYPE = 'ml.g4dn.xlarge';
-export const STARTUP_HEALTH_CHECK_SECONDS = 1200;
+// A SageMaker endpoint cannot be deleted while it is `Creating`, so a broken container is billed for this whole
+// timeout. Loading the 2B model (baked into the image) plus the warm-up takes about 2-4 minutes.
+export const STARTUP_HEALTH_CHECK_SECONDS = 600;
 const DEFAULT_DTYPE = 'float16';
 // Driver 550 / CUDA 12.4. A CUDA 12.x container needs a driver >= 525. [UNVERIFIED on g4dn until the first deploy]
 const DEFAULT_INFERENCE_AMI = 'al2-ami-sagemaker-inference-gpu-3-1';
