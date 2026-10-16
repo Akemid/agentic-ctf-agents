@@ -1,5 +1,7 @@
 import type { AgentCoreApplication } from '@aws/agentcore-cdk';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as ssm from 'aws-cdk-lib/aws-ssm';
+import type { Construct } from 'constructs';
 
 /**
  * Fleet wiring: the environment variables and least-privilege IAM that `agentcore.json` cannot
@@ -12,11 +14,17 @@ import * as iam from 'aws-cdk-lib/aws-iam';
  * Identity permissions (`GetResourceOauth2Token`, the client secret) are NOT granted here: the L3
  * construct already adds them to every runtime role whenever `credentials[]` is non-empty
  * (spikes/FINDINGS.md S3 criterion c). This module adds only SSM reads and the decider endpoint.
+ *
+ * It also PUBLISHES each runtime's ARN as a plain SSM String parameter (`/ctfagents/runtimes/<runtime>/arn`),
+ * so a caller (the web lobby, `scripts/fleet.py`) can find the runtimes without parsing deployed-state or
+ * CloudFormation. Plain parameters, not exports: nothing here creates a CloudFormation export or import.
  */
 
 /** The slice of an AgentCore runtime this module needs. Tests record calls against it. */
 export interface RuntimeEnvLike {
   readonly agentName: string;
+  /** The runtime ARN (what `InvokeAgentRuntime.agentRuntimeArn` takes). A CloudFormation token at synth. */
+  readonly runtimeArn: string;
   addEnvironmentVariable(key: string, value: string): void;
   addToRolePolicy(statement: iam.PolicyStatement): void;
 }
@@ -42,6 +50,8 @@ export const DEFAULT_DECIDER_ENDPOINT_PARAM = '/ctf-decider/endpoint-name';
 export const DEFAULT_DECIDER_ENDPOINT_NAME = 'ctf-decider';
 export const OAUTH_SCOPES = 'agentic-ctf/mcp';
 export const AGENT_STATE_DIR = '/tmp/.agent';
+/** `/ctfagents/runtimes/<runtime>/arn`: where each runtime ARN is published for callers. */
+export const RUNTIME_ARN_PARAM_PREFIX = '/ctfagents/runtimes';
 
 export interface FleetWiringProps {
   readonly account: string;
@@ -83,6 +93,7 @@ function validate(envs: readonly RuntimeEnvLike[], members: readonly FleetMember
 export function adaptEnvironments(app: AgentCoreApplication): RuntimeEnvLike[] {
   return Array.from(app.environments.values(), environment => ({
     agentName: environment.agent.name,
+    runtimeArn: environment.runtime.runtimeArn,
     addEnvironmentVariable: (key: string, value: string) => environment.runtime.addEnvironmentVariable(key, value),
     addToRolePolicy: (statement: iam.PolicyStatement) => environment.runtime.addToPolicy(statement),
   }));
@@ -120,5 +131,31 @@ export function wireFleet(envs: Iterable<RuntimeEnvLike>, props: FleetWiringProp
         })
       );
     }
+  }
+}
+
+export interface PublishRuntimeArnsProps {
+  readonly members?: readonly FleetMember[];
+  readonly prefix?: string;
+}
+
+export function runtimeArnParamName(runtime: string, prefix: string = RUNTIME_ARN_PARAM_PREFIX): string {
+  return `${prefix.replace(/\/$/, '')}/${runtime}/arn`;
+}
+
+/** One plain String parameter per fleet runtime holding its runtime ARN. No exports, no ImportValue. */
+export function publishRuntimeArns(
+  scope: Construct,
+  envs: Iterable<RuntimeEnvLike>,
+  props: PublishRuntimeArnsProps = {}
+): void {
+  const members = props.members ?? FLEET;
+  const byName = validate([...envs], members);
+  for (const member of members) {
+    new ssm.StringParameter(scope, `RuntimeArn${member.runtime.replace(/_/g, '')}`, {
+      parameterName: runtimeArnParamName(member.runtime, props.prefix),
+      stringValue: byName.get(member.runtime)!.runtimeArn,
+      description: `Runtime ARN of the ${member.runtime} agent (InvokeAgentRuntime agentRuntimeArn)`,
+    });
   }
 }

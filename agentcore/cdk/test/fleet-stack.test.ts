@@ -71,9 +71,16 @@ test('exports are only the alpha L3 ones and nothing is imported; wiring never r
   const exportNames = Object.values(json.Outputs ?? {})
     .map((o: any) => o.Export?.Name as string | undefined)
     .filter((n): n is string => n !== undefined);
-  expect(exportNames.length).toBeGreaterThan(0);
-  for (const name of exportNames) {
-    expect(name).toMatch(/^FleetTest-[a-z-]+-(RuntimeId|RuntimeArn|RoleArn)$/);
+  // The L3's own export set is exactly {RuntimeId, RuntimeArn, RoleArn} per runtime: this project adds none.
+  const l3Exports = RUNTIMES.flatMap(n => ['RuntimeId', 'RuntimeArn', 'RoleArn'].map(k => `FleetTest-${n.replace(/_/g, '-')}-${k}`));
+  expect([...exportNames].sort()).toEqual([...l3Exports].sort());
+  // ... and the new SSM parameter resources produced no Output at all (exported or not).
+  const ssmIds = Object.keys(template.findResources('AWS::SSM::Parameter'));
+  expect(ssmIds).toHaveLength(RUNTIMES.length);
+  for (const output of Object.values(json.Outputs ?? {})) {
+    for (const id of ssmIds) {
+      expect(JSON.stringify(output)).not.toContain(id);
+    }
   }
   expect(JSON.stringify(json)).not.toContain('Fn::ImportValue');
   const ssmParameters = Object.entries(json.Parameters ?? {}).filter(
@@ -90,4 +97,27 @@ test('the decider SSM grant names the endpoint parameter, never a wildcard', () 
   const resources = JSON.stringify(ssm.map(s => s.Resource));
   expect(resources).toContain('parameter/ctf-decider/endpoint-name');
   expect(resources).not.toContain('ctf-decider/*');
+});
+
+test('publishes the four runtime ARNs as plain String parameters, with no new exports or imports', () => {
+  const params = Object.values(template.findResources('AWS::SSM::Parameter'));
+  expect(params).toHaveLength(RUNTIMES.length);
+  const byName = Object.fromEntries(params.map((p: any) => [p.Properties.Name, p.Properties]));
+  expect(Object.keys(byName).sort()).toEqual(RUNTIMES.map(n => `/ctfagents/runtimes/${n}/arn`).sort());
+  for (const name of RUNTIMES) {
+    const props = byName[`/ctfagents/runtimes/${name}/arn`];
+    expect(props.Type).toBe('String');
+    // the value is a token that resolves to the runtime's own ARN attribute, never a literal
+    expect(JSON.stringify(props.Value)).toContain('AgentRuntimeArn');
+  }
+  const outputs = Object.values(template.toJSON().Outputs ?? {}) as any[];
+  expect(outputs.filter(o => String(o.Value && JSON.stringify(o.Value)).includes('ctfagents'))).toEqual([]);
+  expect(JSON.stringify(template.toJSON())).not.toContain('Fn::ImportValue');
+});
+
+test('the runtime roles are not granted anything on the published ARN parameters', () => {
+  const statements = Object.values(template.findResources('AWS::IAM::Policy')).flatMap(p =>
+    [p.Properties.PolicyDocument.Statement].flat()
+  );
+  expect(JSON.stringify(statements.map(s => s.Resource))).not.toContain('ctfagents');
 });

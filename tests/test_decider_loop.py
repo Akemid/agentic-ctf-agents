@@ -62,7 +62,9 @@ class FakeDecider:
         }
 
 
-def make_ctx(tokens=None, *, team="auto", options=None, stop=None, on_tick=None, config=None):
+def make_ctx(
+    tokens=None, *, team="auto", options=None, stop=None, on_tick=None, config=None, agent_index=None
+):
     ticks = []
 
     def tick():
@@ -71,7 +73,13 @@ def make_ctx(tokens=None, *, team="auto", options=None, stop=None, on_tick=None,
             on_tick(len(ticks))
 
     request = MatchRequest(
-        action=Action.START, match_id="m1", name="p1", team=team, model="haiku", options=options or {}
+        action=Action.START,
+        match_id="m1",
+        name="p1",
+        team=team,
+        model="haiku",
+        options=options or {},
+        agent_index=agent_index,
     )
     ctx = MatchContext(
         request=request,
@@ -224,6 +232,50 @@ class TestJoin:
         with pytest.raises(RuntimeError, match="could not join"):
             play_against(game, make_ctx(team="blue")[0], FakeDecider(), SequencePlayer([]))
         assert actions(game, "move") == []
+
+    def test_a_requested_slot_is_sent_as_agent_index_to_the_requested_team_only(self):
+        game = FakeGame(turns=1, state=STATE)
+        ctx, _ = make_ctx(team="blue", agent_index=2)
+        play_against(game, ctx, FakeDecider(), SequencePlayer([]))
+        assert actions(game, "join_match") == [
+            {"match_id": "m1", "name": "p1", "team": "blue", "agent_index": 2}
+        ]
+
+    def test_without_a_slot_no_agent_index_is_sent(self):
+        game = FakeGame(turns=1, state=STATE)
+        play_against(game, make_ctx(team="red")[0], FakeDecider(), SequencePlayer([]))
+        assert "agent_index" not in actions(game, "join_match")[0]
+
+    def test_the_seat_the_server_assigned_is_reported_through_the_join_signal(self):
+        game = FakeGame(turns=1, state=STATE, taken_slots=(("red", 0),))
+        ctx, _ = make_ctx(team="red")
+        play_against(game, ctx, FakeDecider(), SequencePlayer([]))
+        assert (ctx.join.outcome.kind, ctx.join.outcome.team, ctx.join.outcome.agent_index) == (
+            "joined",
+            "red",
+            1,
+        )
+
+    def test_a_taken_slot_is_reported_as_a_refusal_and_never_falls_back_to_another_slot(self):
+        game = FakeGame(turns=3, state=STATE, taken_slots=(("red", 1),))
+        ctx, _ = make_ctx(team="red", agent_index=1)
+        with pytest.raises(RuntimeError, match="slot_taken"):
+            play_against(game, ctx, FakeDecider(), SequencePlayer([]))
+        assert (ctx.join.outcome.kind, ctx.join.outcome.reason) == ("refused", "slot_taken")
+        assert len(actions(game, "join_match")) == 1 and actions(game, "move") == []
+
+    def test_the_join_happens_before_the_decider_warm_up_so_start_is_not_held_by_a_cold_endpoint(self):
+        game, decider = FakeGame(turns=1, state=STATE, taken_slots=(("red", 1),)), FakeDecider()
+        with pytest.raises(RuntimeError):
+            play_against(game, make_ctx(team="red", agent_index=1)[0], decider, SequencePlayer([]))
+        assert decider.asked == []  # refused: the decider was never even warmed up
+
+    def test_a_stop_before_the_join_takes_no_seat(self):
+        stop = threading.Event()
+        stop.set()
+        game = FakeGame(turns=1, state=STATE)
+        play_against(game, make_ctx(stop=stop)[0], FakeDecider(), SequencePlayer([]))
+        assert game.actions == []
 
 
 class TestFallback:
@@ -484,3 +536,17 @@ class TestActionGuards:
     def test_a_cancel_before_any_action_reports_that_nothing_ran(self):
         handler = loop.TickCancelHandler(threading.Event())
         assert handler.cancel_tick() is False
+
+
+class TestJoinHonoursStop:
+    def test_a_stop_before_the_join_call_takes_no_seat_and_returns_none(self):
+        game = FakeGame(turns=1, state=STATE)
+        ctx, _ = make_ctx(team="red")
+        stop = threading.Event()
+        stop.set()
+        client = open_mcp_client(
+            "https://x/mcp", ctx.tokens, connect=lambda u, h: in_memory_transport(game.server)
+        )
+        with client:
+            assert loop.join(client, ctx.request, ctx.join, stop) is None
+        assert game.actions == [] and ctx.join.outcome.kind == "cancelled"

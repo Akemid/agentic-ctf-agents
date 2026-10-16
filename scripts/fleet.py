@@ -2,6 +2,7 @@
 """Fleet launcher: start, watch and stop CTF characters across the AgentCore runtimes.
 
     fleet.py start  --match M --agent decider_loop=2 --agent harness_sdk=1 [--teams 2] [--model haiku] [--yes]
+    fleet.py start  --match M --agent decider_loop=1 --team red --agent-index 1 [--yes]  # an exact seat
     fleet.py status [--match M] [--wake]
     fleet.py stop   (--match M | --all) [--hard] [--yes]
 
@@ -19,8 +20,15 @@ and `stop` ends them with `StopRuntimeSession` only.
 
 Safety: `start` and `stop` print a plan and change nothing unless `--yes` is given. Limits
 (3 characters per agent type, 2 teams) are checked before the first invocation. Runtime ARNs
-come from `--runtime-arn RUNTIME=ARN` or from `agentcore/.cli/deployed-state.json` (local,
-gitignored: it holds account ARNs).
+come from `--runtime-arn RUNTIME=ARN`, else from `agentcore/.cli/deployed-state.json` (local,
+gitignored: it holds account ARNs), else from the SSM parameters `/ctfagents/runtimes/<runtime>/arn`
+that the AgentCore stack publishes (needs `ssm:GetParameters` on them).
+
+`start` is synchronous up to the seat: the runtime answers only after `join_match`, so a started
+character prints the team and agent_index the server really gave it, and a refused seat
+(`slot_taken`, `match_full`, ...) is a failed start with the reason. `--agent-index N` (0..2, the name and
+range of the server's `join_match`; `--slot` is an equivalent option, the web lobby's key) takes exactly one
+seat and needs `--team red|blue`; a requested seat is never traded for another one.
 
 Exit codes: 0 ok, 1 at least one invocation failed, 2 the request was rejected (nothing invoked).
 """
@@ -48,6 +56,9 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_STATE_DIR = ROOT / ".fleet"
 DEFAULT_DEPLOYED_STATE = ROOT / "agentcore" / ".cli" / "deployed-state.json"
 DEFAULT_USER_ID = "fleet-launcher"
+SSM_ARN_PREFIX = "/ctfagents/runtimes"
+AGENT_INDEX_MAX = 2
+EXPLICIT_TEAMS = ("red", "blue")
 MODELS = ("haiku", "opus", "nova-lite")  # mirrors ctf_common.payload.MODELS (contract-tested)
 MATCH_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 START_ACKS = frozenset({"started", "already_running"})
@@ -67,6 +78,7 @@ class Character:
     team: str
     session_id: str
     match_id: str
+    agent_index: int | None = None
 
 
 # --- planning (pure) ---------------------------------------------------------------------------
@@ -109,8 +121,15 @@ def plan_launch(
     *,
     existing: Sequence[Mapping[str, Any]] = (),
     token: Callable[[], str] = lambda: uuid.uuid4().hex,
+    team: str | None = None,
+    agent_index: int | None = None,
 ) -> list[Character]:
-    """Validate a launch request and expand it into characters. Raises LaunchError, never invokes."""
+    """Validate a launch request and expand it into characters. Raises LaunchError, never invokes.
+
+    `team` (red|blue) pins every character to that team instead of alternating. `agent_index` (0..2, the
+    server's own name and range) also needs an explicit team and exactly one character: it names the lobby
+    seat, and the character is named after it (`<runtime>-<team>-<agent_index+1>`, the server's scheme).
+    """
     if not MATCH_ID_RE.fullmatch(match_id):
         raise LaunchError("match id must match ^[A-Za-z0-9_-]{1,64}$")
     if teams < 1:
@@ -126,6 +145,16 @@ def plan_launch(
             raise LaunchError(f"{runtime}: negative count")
     if sum(counts.values()) == 0:
         raise LaunchError("no characters requested")
+    if team not in (None, "auto", *EXPLICIT_TEAMS):
+        raise LaunchError("team must be red, blue or auto")
+    if agent_index is not None:
+        if team not in EXPLICIT_TEAMS:
+            raise LaunchError("--agent-index needs --team red or --team blue (a seat belongs to one team)")
+        if not 0 <= agent_index <= AGENT_INDEX_MAX:
+            raise LaunchError(f"agent_index must be between 0 and {AGENT_INDEX_MAX}")
+        if sum(counts.values()) != 1:
+            raise LaunchError("--agent-index targets exactly one character")
+    pinned_team = team if team in EXPLICIT_TEAMS else None
 
     active_total = sum(1 for s in existing if _is_active(s))
     characters: list[Character] = []
@@ -142,25 +171,34 @@ def plan_launch(
             )
         base = item.runtime.replace("_", "-")
         for offset in range(count):
-            name = f"{base}-{len(recorded) + offset + 1}"
-            team = "red" if (active_total + len(characters)) % teams == 0 else "blue"
+            if agent_index is not None:
+                name = f"{base}-{pinned_team}-{agent_index + 1}"
+            else:
+                name = f"{base}-{len(recorded) + offset + 1}"
+            side = pinned_team or ("red" if (active_total + len(characters)) % teams == 0 else "blue")
             session_id = f"ctf-{match_id}-{name}-{token()}"
-            characters.append(Character(item.runtime, name, team, session_id, match_id))
+            characters.append(Character(item.runtime, name, side, session_id, match_id, agent_index))
     return characters
 
 
 def build_payload(character: Character, *, model: str = "haiku") -> dict[str, Any]:
     """The `start` payload (contract: ctf_common.payload.parse_payload)."""
-    return {
+    payload: dict[str, Any] = {
         "action": "start",
         "match_id": character.match_id,
         "name": character.name,
         "team": character.team,
         "model": model,
     }
+    if character.agent_index is not None:
+        payload["agent_index"] = character.agent_index
+    return payload
 
 
 # --- runtime ARNs ------------------------------------------------------------------------------
+
+
+SsmFactory = Callable[[str | None], Any]
 
 
 def resolve_runtime_arns(
@@ -168,30 +206,63 @@ def resolve_runtime_arns(
     overrides: Mapping[str, str],
     deployed_state: Path,
     target: str | None,
+    *,
+    ssm_factory: SsmFactory | None = None,
+    ssm_region: str | None = None,
 ) -> dict[str, str]:
+    """`--runtime-arn` first, then deployed-state, then SSM for whatever is still missing."""
     arns = {rt: overrides[rt] for rt in needed if rt in overrides}
     missing = [rt for rt in needed if rt not in arns]
     if not missing:
         return arns
+    problem = ""
     if not deployed_state.is_file():
-        raise LaunchError(
-            f"no runtime ARN for {', '.join(missing)}: {deployed_state.name} not found. "
-            "Run `agentcore deploy` first or pass --runtime-arn RUNTIME=ARN"
+        problem = f"{deployed_state.name} not found"
+    else:
+        try:
+            targets = json.loads(deployed_state.read_text()).get("targets", {})
+        except ValueError:
+            raise LaunchError(f"{deployed_state.name} is not valid JSON") from None
+        if target is None:
+            if len(targets) != 1:
+                raise LaunchError(
+                    f"{deployed_state.name} has {len(targets)} targets: choose one with --target"
+                )
+            target = next(iter(targets))
+        runtimes = targets.get(target, {}).get("resources", {}).get("runtimes", {})
+        arns.update(
+            {rt: runtimes[rt]["runtimeArn"] for rt in missing if "runtimeArn" in runtimes.get(rt, {})}
         )
-    try:
-        targets = json.loads(deployed_state.read_text()).get("targets", {})
-    except ValueError:
-        raise LaunchError(f"{deployed_state.name} is not valid JSON") from None
-    if target is None:
-        if len(targets) != 1:
-            raise LaunchError(f"{deployed_state.name} has {len(targets)} targets: choose one with --target")
-        target = next(iter(targets))
-    runtimes = targets.get(target, {}).get("resources", {}).get("runtimes", {})
-    absent = [rt for rt in missing if "runtimeArn" not in runtimes.get(rt, {})]
-    if absent:
-        raise LaunchError(f"runtime(s) not in deployed-state target '{target}': {', '.join(absent)}")
-    arns.update({rt: runtimes[rt]["runtimeArn"] for rt in missing})
+        missing = [rt for rt in missing if rt not in arns]
+        if not missing:
+            return arns
+        problem = f"runtime(s) not in deployed-state target '{target}': {', '.join(missing)}"
+    arns.update(_arns_from_ssm(missing, problem, ssm_factory, ssm_region))
     return arns
+
+
+def _arns_from_ssm(
+    missing: Sequence[str], problem: str, ssm_factory: SsmFactory | None, region: str | None
+) -> dict[str, str]:
+    """Read `/ctfagents/runtimes/<runtime>/arn`. Any failure explains every way out, never a traceback."""
+    names = {f"{SSM_ARN_PREFIX}/{rt}/arn": rt for rt in missing}
+    hint = (
+        f"no runtime ARN for {', '.join(missing)} ({problem}). Run `agentcore deploy` first, "
+        "pass --runtime-arn RUNTIME=ARN"
+    )
+    try:
+        client = (ssm_factory or _default_ssm_factory)(region)
+        reply = client.get_parameters(Names=list(names))
+    except Exception as exc:  # noqa: BLE001 - credentials, permissions, throttling: all end in a clear rejection
+        raise LaunchError(
+            f"{hint}, or allow ssm:GetParameters on {SSM_ARN_PREFIX}/* (SSM: {_error_code(exc)})"
+        ) from None
+    found = {names[p["Name"]]: p["Value"] for p in reply.get("Parameters", []) if p.get("Name") in names}
+    absent = [rt for rt in missing if rt not in found]
+    if absent:
+        wanted = ", ".join(f"{SSM_ARN_PREFIX}/{rt}/arn" for rt in absent)
+        raise LaunchError(f"{hint}, or deploy the stack that publishes {wanted}")
+    return found
 
 
 # --- state -------------------------------------------------------------------------------------
@@ -271,6 +342,8 @@ class Reply:
     ticks: Any = None
     error: str = ""
     answered: bool = False  # the runtime replied (even with a bad status); False for transport errors
+    team: str | None = None  # the seat the runtime reported on `started` (what the server really assigned)
+    agent_index: int | None = None
 
 
 def _region_of(arn: str) -> str:
@@ -325,7 +398,18 @@ def _call(
         ticks=reply.get("ticks"),
         error=str(reply.get("error", ""))[:ERROR_PREVIEW],
         answered=True,
+        team=reply.get("team") if isinstance(reply.get("team"), str) else None,
+        agent_index=_reply_agent_index(reply),
     )
+
+
+def _reply_agent_index(reply: Mapping[str, Any]) -> int | None:
+    """`agent_index` is canonical; `slot` is the equivalent key the runtime also replies with."""
+    for key in ("agent_index", "slot"):
+        value = reply.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
 
 
 class ClientPool:
@@ -344,6 +428,12 @@ def _default_factory(region: str) -> Any:
     import boto3  # noqa: PLC0415
 
     return boto3.client("bedrock-agentcore", region_name=region)
+
+
+def _default_ssm_factory(region: str | None) -> Any:
+    import boto3  # noqa: PLC0415
+
+    return boto3.client("ssm", region_name=region)
 
 
 # --- commands ----------------------------------------------------------------------------------
@@ -389,12 +479,28 @@ def _load_or_new(state: FleetState, match_id: str) -> dict[str, Any]:
     return state.load(match_id) if state.exists(match_id) else {"match_id": match_id, "sessions": []}
 
 
-def cmd_start(args: argparse.Namespace, state: FleetState, pool: ClientPool, clock: Clock) -> int:
+def cmd_start(
+    args: argparse.Namespace,
+    state: FleetState,
+    pool: ClientPool,
+    clock: Clock,
+    ssm_factory: SsmFactory | None = None,
+) -> int:
     counts = _parse_agents(args.agent)
     overrides = _parse_arns(args.runtime_arn)
     # Validate and show the plan without taking the lock or creating anything (the dry run).
-    plan = plan_launch(args.match, counts, args.teams, existing=_load_or_new(state, args.match)["sessions"])
-    resolve_runtime_arns(sorted({c.runtime for c in plan}), overrides, args.deployed_state, args.target)
+    existing = _load_or_new(state, args.match)["sessions"]
+    plan = plan_launch(
+        args.match, counts, args.teams, existing=existing, team=args.team, agent_index=args.agent_index
+    )
+    resolved = resolve_runtime_arns(
+        sorted({c.runtime for c in plan}),
+        overrides,
+        args.deployed_state,
+        args.target,
+        ssm_factory=ssm_factory,
+        ssm_region=args.region,
+    )
     _print_plan(plan, args)
     if not args.yes:
         print("Dry run: nothing was invoked. Add --yes to start these characters.")
@@ -402,10 +508,26 @@ def cmd_start(args: argparse.Namespace, state: FleetState, pool: ClientPool, clo
 
     with state.locked(args.match):
         record = _load_or_new(state, args.match)  # authoritative: re-read and re-plan under the lock
-        plan = plan_launch(args.match, counts, args.teams, existing=record["sessions"])
-        arns = resolve_runtime_arns(
-            sorted({c.runtime for c in plan}), overrides, args.deployed_state, args.target
+        plan = plan_launch(
+            args.match,
+            counts,
+            args.teams,
+            existing=record["sessions"],
+            team=args.team,
+            agent_index=args.agent_index,
         )
+        needed = sorted({c.runtime for c in plan})
+        # The re-plan under the lock rarely changes the runtimes: do not ask SSM a second time for them.
+        arns = {rt: resolved[rt] for rt in needed if rt in resolved}
+        if len(arns) < len(needed):
+            arns = resolve_runtime_arns(
+                needed,
+                overrides,
+                args.deployed_state,
+                args.target,
+                ssm_factory=ssm_factory,
+                ssm_region=args.region,
+            )
         failures: list[str] = []
         for character in plan:
             arn = arns[character.runtime]
@@ -414,11 +536,14 @@ def cmd_start(args: argparse.Namespace, state: FleetState, pool: ClientPool, clo
             session: dict[str, Any] = {
                 "runtime": character.runtime,
                 "name": character.name,
-                "team": character.team,
+                # `started` carries the seat the server really assigned: that wins over the plan.
+                "team": (reply.team if reply.ok and reply.team else character.team),
                 "session_id": character.session_id,
                 "runtime_arn": arn,
                 "ack": reply.status if reply.ok else "failed",
             }
+            if reply.ok and reply.agent_index is not None:
+                session["agent_index"] = reply.agent_index
             if reply.ok:
                 session["started_at"] = clock().isoformat()
             _stamp(session, reply, clock())
@@ -427,7 +552,7 @@ def cmd_start(args: argparse.Namespace, state: FleetState, pool: ClientPool, clo
                 failures.append(_failure_line(session, "start", reply))
             record["sessions"].append(session)
             state.save(record)  # after every character: an interrupted launch is still stoppable
-            print(f"  {character.name}: {'ok (' + reply.status + ')' if reply.ok else 'FAILED'}")
+            print(f"  {character.name}: {_start_outcome(reply)}")
     if failures:
         print(f"{len(failures)} of {len(plan)} start(s) failed:", file=sys.stderr)
         print("\n".join(failures), file=sys.stderr)
@@ -436,10 +561,21 @@ def cmd_start(args: argparse.Namespace, state: FleetState, pool: ClientPool, clo
     return 0
 
 
+def _start_outcome(reply: Reply) -> str:
+    """One line per character: `ok (started) team red agent_index 1`, or the reason the runtime refused."""
+    if not reply.ok:
+        return f"FAILED: {reply.error or reply.status}"
+    seat = ""
+    if reply.team is not None and reply.agent_index is not None:
+        seat = f" team {reply.team} agent_index {reply.agent_index}"
+    return f"ok ({reply.status}){seat}"
+
+
 def _print_plan(plan: Sequence[Character], args: argparse.Namespace) -> None:
     print(f"Plan: {len(plan)} character(s) for match '{args.match}', model {args.model}")
     for character in plan:
-        print(f"  {character.runtime:<15} {character.name:<20} team {character.team}")
+        seat = "" if character.agent_index is None else f" agent_index {character.agent_index}"
+        print(f"  {character.runtime:<15} {character.name:<20} team {character.team}{seat}")
 
 
 def _selected_matches(args: argparse.Namespace, state: FleetState) -> list[str]:
@@ -561,6 +697,24 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument(
         "--teams", type=int, default=2, help="1 (all red) or 2 (alternate red/blue); default 2"
     )
+    start.add_argument(
+        "--team",
+        choices=("red", "blue", "auto"),
+        default=None,
+        help="pin every character to a team (default: alternate by --teams)",
+    )
+    start.add_argument(
+        "--agent-index",
+        "--slot",  # equivalent alias (the web lobby's key)
+        dest="agent_index",
+        type=int,
+        default=None,
+        help="take this lobby seat (0..2, the server's agent_index) of --team; exactly one character, "
+        "never another seat (--slot is an equivalent option)",
+    )
+    start.add_argument(
+        "--region", default=None, help="region of the SSM parameters (default: the AWS default)"
+    )
     start.add_argument("--model", choices=MODELS, default="haiku")
     start.add_argument("--runtime-arn", action="append", default=[], metavar="RUNTIME=ARN")
     start.add_argument("--deployed-state", type=Path, default=DEFAULT_DEPLOYED_STATE)
@@ -590,14 +744,17 @@ def main(
     *,
     client_factory: Callable[[str], Any] | None = None,
     clock: Clock = _utc_now,
+    ssm_factory: SsmFactory | None = None,
 ) -> int:
     args = build_parser().parse_args(argv)
     state = FleetState(args.state_dir)
     pool = ClientPool(client_factory or _default_factory)
-    commands = {"start": cmd_start, "status": cmd_status, "stop": cmd_stop}
     try:
         if args.match is not None:
             state.path(args.match)  # every subcommand rejects a bad match id before touching anything
+        if args.command == "start":
+            return cmd_start(args, state, pool, clock, ssm_factory)
+        commands = {"status": cmd_status, "stop": cmd_stop}
         return commands[args.command](args, state, pool, clock)
     except LaunchError as exc:
         print(f"rejected: {exc}", file=sys.stderr)

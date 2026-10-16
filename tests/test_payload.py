@@ -240,3 +240,59 @@ class TestRequireMatchId:
         request = MatchRequest(action=Action.STOP, match_id=None, name="n", team="auto", model="haiku")
         with pytest.raises(PayloadError, match="match_id is required"):
             require_match_id(request)
+
+
+class TestSlot:
+    """Lobby wake contract: an optional `agent_index` (0..2, like join_match) that requires an explicit team.
+
+    `slot` (the lobby's key) is an equivalent key with the same validation."""
+
+    def test_slot_defaults_to_none(self):
+        assert parse({"match_id": "m1"}).agent_index is None
+        assert parse({"match_id": "m1", "team": "red"}).agent_index is None
+
+    @pytest.mark.parametrize("slot", [0, 1, 2])
+    @pytest.mark.parametrize("team", ["red", "blue"])
+    def test_a_slot_with_an_explicit_team_is_carried_in_the_request(self, team, slot):
+        req = parse({"match_id": "m1", "team": team, "agent_index": slot})
+        assert (req.team, req.agent_index) == (team, slot)
+
+    def test_slot_with_team_auto_is_rejected(self):
+        with pytest.raises(PayloadError, match="agent_index requires an explicit team"):
+            parse({"match_id": "m1", "team": "auto", "agent_index": 0})
+
+    def test_slot_without_a_team_is_rejected_because_team_defaults_to_auto(self):
+        with pytest.raises(PayloadError, match="agent_index requires an explicit team"):
+            parse({"match_id": "m1", "agent_index": 1})
+
+    @pytest.mark.parametrize("slot", [-1, 3, 99])
+    def test_out_of_range_slot_is_rejected(self, slot):
+        with pytest.raises(PayloadError, match="agent_index must be an integer between 0 and 2"):
+            parse({"match_id": "m1", "team": "red", "agent_index": slot})
+
+    @pytest.mark.parametrize("slot", [True, False, 1.0, "1", None, [0]])
+    def test_non_integer_slot_is_rejected_and_bool_is_not_an_int(self, slot):
+        with pytest.raises(PayloadError, match="agent_index must be an integer between 0 and 2"):
+            parse({"match_id": "m1", "team": "red", "agent_index": slot})
+
+    def test_slot_survives_the_prompt_wrapper(self):
+        req = parse({"prompt": json.dumps({"match_id": "m1", "team": "blue", "agent_index": 2})})
+        assert req.agent_index == 2
+
+    def test_slot_is_an_equivalent_key_to_agent_index(self):
+        req = parse({"match_id": "m1", "team": "red", "slot": 2})
+        assert (req.team, req.agent_index) == ("red", 2)
+
+    def test_the_alias_has_the_same_validation(self):
+        with pytest.raises(PayloadError, match="agent_index must be an integer between 0 and 2"):
+            parse({"match_id": "m1", "team": "red", "slot": 3})
+        with pytest.raises(PayloadError, match="agent_index requires an explicit team"):
+            parse({"match_id": "m1", "slot": 1})
+
+    def test_both_keys_with_the_same_value_are_accepted(self):
+        req = parse({"match_id": "m1", "team": "blue", "agent_index": 1, "slot": 1})
+        assert req.agent_index == 1
+
+    def test_both_keys_that_differ_are_rejected_with_a_clear_error(self):
+        with pytest.raises(PayloadError, match="agent_index and slot differ"):
+            parse({"match_id": "m1", "team": "blue", "agent_index": 1, "slot": 2})

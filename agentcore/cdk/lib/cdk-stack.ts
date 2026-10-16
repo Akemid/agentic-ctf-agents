@@ -11,7 +11,7 @@ import {
 import { CfnOutput, Stack, type StackProps } from 'aws-cdk-lib';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import { Construct } from 'constructs';
-import { adaptEnvironments, wireFleet } from './fleet-wiring';
+import { adaptEnvironments, publishRuntimeArns, wireFleet } from './fleet-wiring';
 
 /**
  * Harness deployment config: role-scoped fields (for IAM role + container build)
@@ -129,11 +129,14 @@ export class AgentCoreStack extends Stack {
     // Fleet env vars and least-privilege IAM (SSM, decider endpoint). Guard on the SPEC, not on the
     // constructed environments: a spec with runtimes must be wired (or fail loudly), never skipped.
     if ((spec.runtimes?.length ?? 0) > 0) {
-      wireFleet(adaptEnvironments(this.application), {
+      const fleet = adaptEnvironments(this.application);
+      wireFleet(fleet, {
         account: this.account,
         region: this.region,
         partition: this.partition,
       });
+      // The runtime ARNs, as plain SSM parameters, for callers outside this stack (web lobby, fleet.py).
+      publishRuntimeArns(this, fleet);
     }
 
     // Create AgentCoreMcp if there are gateways configured

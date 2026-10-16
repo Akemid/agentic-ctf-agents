@@ -45,8 +45,8 @@ class Client:
     async def __aexit__(self, *exc):
         return await self._stack.__aexit__(*exc)
 
-    async def join(self, team="red"):
-        return await call(self.session, "join_match", match_id="m1", team=team)
+    async def join(self, team="red", **extra):
+        return await call(self.session, "join_match", match_id="m1", team=team, **extra)
 
     async def tool(self, name, **arguments):
         return await call(self.session, name, **arguments)
@@ -82,6 +82,120 @@ class TestJoinResult:
         async with Client(FakeGame(turns=1, finished=True)) as c:
             is_error, payload = await c.join()
         assert is_error and payload["reason"] == "match_finished"
+
+
+SLOT_ERRORS = {"slot_taken", "match_full", "match_already_started", "match_finished", "unauthorized"}
+
+
+class TestJoinSlots:
+    """`agent_index` seats, and the server's tool-error shape `{reason, detail?}` for every refusal."""
+
+    async def test_agent_index_is_echoed_in_the_join_result(self):
+        async with Client(FakeGame(turns=1)) as c:
+            is_error, joined = await c.join("blue", agent_index=2)
+        assert not is_error
+        assert (joined["team"], joined["agent_index"], joined["agent_id"]) == ("blue", 2, "blue-3")
+
+    async def test_omitted_agent_index_takes_the_lowest_free_slot(self):
+        game = FakeGame(turns=1, taken_slots=(("red", 0), ("red", 1)))
+        async with Client(game) as c:
+            _, joined = await c.join("red")
+        assert joined["agent_index"] == 2
+
+    async def test_a_taken_slot_is_slot_taken_and_never_falls_back(self):
+        game = FakeGame(turns=1, taken_slots=(("red", 1),))
+        async with Client(game) as c:
+            is_error, payload = await c.join("red", agent_index=1)
+        assert is_error and payload["reason"] == "slot_taken"
+        assert game.joined is False  # the refused session is not seated anywhere
+
+    async def test_two_sessions_cannot_share_a_slot(self):
+        game = FakeGame(turns=1)
+        async with Client(game) as first, Client(game) as second:
+            assert not (await first.join("red", agent_index=0))[0]
+            is_error, payload = await second.join("red", agent_index=0)
+        assert is_error and payload["reason"] == "slot_taken"
+
+    async def test_a_second_join_on_the_same_session_is_already_joined(self):
+        async with Client(FakeGame(turns=1)) as c:
+            assert not (await c.join("red", agent_index=0))[0]
+            is_error, payload = await c.join("red", agent_index=1)
+        assert is_error and payload["reason"] == "already_joined"
+
+    @pytest.mark.parametrize(
+        ("flag", "reason"),
+        [("full", "match_full"), ("started", "match_already_started")],
+    )
+    async def test_lobby_refusals_are_tool_errors_with_a_reason(self, flag, reason):
+        async with Client(FakeGame(turns=1, **{flag: True})) as c:
+            is_error, payload = await c.join("red", agent_index=0)
+        assert is_error and payload["reason"] == reason
+        assert set(payload) <= {"reason", "detail"}
+        assert reason in SLOT_ERRORS
+
+    @pytest.mark.parametrize("index", [-1, 3])
+    async def test_an_out_of_range_agent_index_is_invalid_arguments(self, index):
+        async with Client(FakeGame(turns=1)) as c:
+            is_error, payload = await c.join("red", agent_index=index)
+        assert is_error and payload["reason"] == "invalid_arguments"
+
+
+class TestJoinRefusalOrder:
+    """The server checks: invalid_arguments, then already_joined, then the lobby reasons in this order:
+    unknown_match, match_full, slot_taken, unauthorized, match_already_started, match_finished."""
+
+    async def test_invalid_arguments_beats_already_joined(self):
+        async with Client(FakeGame(turns=1)) as c:
+            assert not (await c.join("red", agent_index=0))[0]
+            is_error, payload = await c.join("red", agent_index=7)
+        assert is_error and payload["reason"] == "invalid_arguments"
+
+    @pytest.mark.parametrize("flag", ["full", "started", "finished"])
+    async def test_already_joined_beats_every_lobby_reason(self, flag):
+        game = FakeGame(turns=1)
+        async with Client(game) as c:
+            assert not (await c.join("red", agent_index=0))[0]
+            setattr(game, flag, True)  # the lobby state changes after the seat was taken
+            is_error, payload = await c.join("red", agent_index=1)
+        assert is_error and payload["reason"] == "already_joined"
+
+    async def test_an_unknown_match_is_unknown_match_and_beats_the_other_lobby_reasons(self):
+        async with Client(FakeGame(turns=1, known_match="other", full=True, started=True)) as c:
+            is_error, payload = await c.join("red", agent_index=0)
+        assert is_error and payload["reason"] == "unknown_match"
+
+    async def test_match_full_beats_slot_taken(self):
+        async with Client(FakeGame(turns=1, full=True, taken_slots=(("red", 1),))) as c:
+            _, payload = await c.join("red", agent_index=1)
+        assert payload["reason"] == "match_full"
+
+    async def test_slot_taken_beats_match_already_started_and_match_finished(self):
+        async with Client(FakeGame(turns=1, started=True, finished=True, taken_slots=(("red", 1),))) as c:
+            _, payload = await c.join("red", agent_index=1)
+        assert payload["reason"] == "slot_taken"
+
+    async def test_unauthorized_beats_match_already_started_and_match_finished(self):
+        game = FakeGame(turns=1, started=True, finished=True, disconnected_slots=(("red", 1),))
+        async with Client(game) as c:
+            _, payload = await c.join("red", agent_index=1)
+        assert payload["reason"] == "unauthorized"
+
+    async def test_match_already_started_beats_match_finished(self):
+        async with Client(FakeGame(turns=1, started=True, finished=True)) as c:
+            _, payload = await c.join("red", agent_index=0)
+        assert payload["reason"] == "match_already_started"
+
+    async def test_unauthorized_is_only_for_a_disconnected_slot_owned_by_another_subject(self):
+        game = FakeGame(turns=1, disconnected_slots=(("red", 1),))
+        async with Client(game) as c:
+            is_error, payload = await c.join("red", agent_index=1)
+            assert is_error and payload["reason"] == "unauthorized"
+            assert not (await c.join("red", agent_index=0))[0]  # any other seat is fine
+
+    async def test_an_unrelated_player_is_never_unauthorized(self):
+        async with Client(FakeGame(turns=1)) as c:
+            is_error, joined = await c.join("red", agent_index=1)
+        assert not is_error and joined["agent_index"] == 1
 
 
 class TestGetMap:

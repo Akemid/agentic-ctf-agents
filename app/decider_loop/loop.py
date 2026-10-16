@@ -37,8 +37,9 @@ from ctf_common import wiring
 from ctf_common.auth import TokenProvider
 from ctf_common.decider import DeciderPort, ServerUnavailable, make_decider
 from ctf_common.hooks import is_connection_lost
+from ctf_common.join import JoinSignal, seat_in_code
 from ctf_common.mcp import open_mcp_client, raise_on_auth_failure
-from ctf_common.payload import require_match_id
+from ctf_common.payload import MatchRequest, require_match_id
 from ctf_common.prompts import MODEL_ALIASES
 from ctf_common.runner import AsyncTaskApp, MatchContext, MatchRunner, PlayFn
 from loop_logic import (
@@ -180,15 +181,34 @@ class Joined(NamedTuple):
     map_info: MapInfo | None  # None when the join result carried no usable `map`
 
 
-def join(client: Any, match: str, name: str, team: str) -> Joined:
-    """Join the requested team; `auto` tries red first, then blue. Returns the team and the static map."""
-    for candidate in ("red", "blue") if team == "auto" else (team,):
-        outcome = call_tool(client, TOOL_JOIN, {"match_id": match, "team": candidate, "name": name})
-        if not outcome["_is_error"]:
-            log.info("joined match %s as %s on team %s", match, name, candidate)
-            return Joined(candidate, parse_map(outcome.get("map")))
-        log.warning("join as %s failed: %s", candidate, outcome)
-    raise RuntimeError(f"could not join match {match} on {'either team' if team == 'auto' else team}")
+def join(
+    client: Any, request: MatchRequest, signal: JoinSignal, stop: threading.Event | None = None
+) -> Joined | None:
+    """Seat the character (code-owned) and report the outcome to `start` through `signal`.
+
+    Only the requested team is tried (`auto`: red, then blue after a `match_full`), and a requested slot is
+    sent as `agent_index` and never traded for another one. Returns the team the server assigned and the
+    static map; None when `stop` was set before a join call; raises when the seat was refused or errored.
+    """
+    match = require_match_id(request)
+    payload = seat_in_code(client, request, signal, stop)
+    outcome = signal.outcome
+    if outcome is not None and outcome.kind == "cancelled":
+        return None
+    if payload is None:
+        reason = outcome.reason if outcome is not None else "unknown"
+        if outcome is not None and outcome.kind == "error":
+            raise McpConnectionLost(f"MCP connection lost during {TOOL_JOIN}: {reason}")
+        log.warning("join_match refused for %s: %s", request.name, reason)
+        raise RuntimeError(f"could not join match {match} on {request.team}: {reason}")
+    log.info(
+        "joined match %s as %s on team %s (agent_index %s)",
+        match,
+        request.name,
+        payload["team"],
+        payload["agent_index"],
+    )
+    return Joined(str(payload["team"]), parse_map(payload.get("map")))
 
 
 def fetch_map(client: Any) -> MapInfo | None:
@@ -309,8 +329,13 @@ def run_match(ctx: MatchContext, client: Any, decider: DeciderPort, model: Any) 
         hooks=[StopAfterActionHook()],  # end the turn after the action: no wasted 2nd model call
     )
 
+    if ctx.stop.is_set():  # stopped before taking a seat: do not join
+        return stats
+    # Join BEFORE the warm-up: `start` is waiting for the seat, and a cold decider endpoint must not hold it.
+    joined = join(client, request, ctx.join, ctx.stop)
+    if joined is None:  # stopped between opening the client and the join call
+        return stats
     warm_up(decider)
-    joined = join(client, require_match_id(request), request.name, request.team)
     map_info = joined.map_info or fetch_map(client)  # an older server: fetch the static map once instead
     if map_info is None:
         log.warning("no static map (join_match.map / get_map): field-dependent hints are off for this match")

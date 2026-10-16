@@ -1,8 +1,8 @@
 """Strands hooks and conversation manager shared by the LLM-driven runtimes.
 
 `make_conversation_manager` is extracted from `local/agent/refined/harness_sdk.py` (characterization-tested).
-`StopRequestedHook`, `ConnectionLostHook` and `TickCounterHook` are new: they connect the agent loop to the
-MatchRunner.
+`StopRequestedHook`, `ConnectionLostHook`, `TickCounterHook` and `ForceJoinArgsHook` are new: they connect
+the agent loop to the MatchRunner.
 
 There is deliberately no hook that strips static board data from turns: since the game server's MCP turn
 contract v2 the turn `state` no longer carries `grid`, `walls`, `fields` or `flags[].base`. The static map
@@ -20,6 +20,9 @@ from typing import Any
 from strands.agent.conversation_manager import SlidingWindowConversationManager
 from strands.hooks import AfterToolCallEvent, AfterToolsEvent, BeforeToolCallEvent
 
+from .join import AUTO_TEAMS, RETRY_OTHER_TEAM_REASON, JoinSignal, join_reason, report_join_result
+from .toolresult import is_connection_lost, result_is_error
+
 # One tick is 4 messages: assistant(wait_for_turn) + result + assistant(action) + result.
 # 12 messages therefore keep about the last 3 ticks, enough to see where we are heading
 # without paying for the whole match on every model call. The `window_size` limit counts
@@ -30,26 +33,11 @@ DEFAULT_WINDOW = 12
 
 STOP_MESSAGE = "Match stopped by the operator."
 CONNECTION_LOST_MESSAGE = "MCP connection lost; ending the match."
-# Strands turns a dead MCP connection into an ERROR tool result (it never raises into the agent loop),
-# so the original cause (e.g. a mid-match HTTP 401) is only visible when the client context exits.
-_CONNECTION_LOST_MARKERS = (
-    "Connection to the MCP server was closed",
-    "the client session is not running",
+JOIN_FAILED_MESSAGE = "join_match failed; ending the match."
+ALREADY_JOINED_REASON = "already_joined"  # the server's reason for a second join_match on one session
+ALREADY_JOINED_MESSAGE = (
+    "You are already seated in the match: do not call join_match again. Continue with wait_for_turn."
 )
-
-
-def is_connection_lost(result: Any) -> bool:
-    """True for an error tool result that says the MCP connection is dead (pure).
-
-    Strands does not raise when the connection drops mid-match: it returns an error tool result.
-    """
-    if not isinstance(result, dict) or result.get("status") != "error":
-        return False
-    for block in result.get("content") or []:
-        text = block.get("text") if isinstance(block, dict) else None
-        if isinstance(text, str) and any(marker in text for marker in _CONNECTION_LOST_MARKERS):
-            return True
-    return False
 
 
 def make_conversation_manager(window: int = DEFAULT_WINDOW) -> SlidingWindowConversationManager:
@@ -63,6 +51,10 @@ def make_conversation_manager(window: int = DEFAULT_WINDOW) -> SlidingWindowConv
 
 def _is_wait_for_turn(name: Any) -> bool:
     return isinstance(name, str) and (name == "wait_for_turn" or name.endswith("_wait_for_turn"))
+
+
+def _is_join_match(name: Any) -> bool:
+    return isinstance(name, str) and (name == "join_match" or name.endswith("_join_match"))
 
 
 class StopRequestedHook:
@@ -112,6 +104,98 @@ class ConnectionLostHook:
     def after_tools(self, event: Any) -> None:
         if self.lost:
             event.end_turn = CONNECTION_LOST_MESSAGE
+
+
+class ForceJoinArgsHook:
+    """The model never decides where the character sits: the runtime forces `join_match`'s arguments.
+
+    Before the call, `match_id`, `name`, `team` and `agent_index` are overwritten with the requested values
+    (and anything else the model passed is dropped; `agent_index` is removed when no slot was requested, so
+    the server picks the lowest free one). A Strands `BeforeToolCallEvent` hook can mutate
+    `event.tool_use["input"]`: the executor re-reads it after the hooks (verified on strands 1.61, and the
+    programmatic tool caller's inner calls fire the same event).
+
+    After the call, the outcome goes to the runner's `JoinSignal` (the seat the server assigned, or why it
+    refused). A failed join ends the turn (`AfterToolsEvent.end_turn`) so the model can never retry into
+    another slot. With `team="auto"` the hook offers red, then blue after a `match_full`, and nothing else.
+    A second `join_match` after a successful join is cancelled here: the server would answer
+    `already_joined` and that must not fail a match that is running.
+    """
+
+    def __init__(
+        self, match_id: str, name: str, team: str, agent_index: int | None, join: JoinSignal
+    ) -> None:
+        self._match_id = match_id
+        self._name = name
+        self._team = team
+        self._agent_index = agent_index
+        self._join = join
+        self._tried: list[str] = []
+        self._offered: str | None = None
+        self._last_refusal: str | None = None  # a `match_full` that left another team to try
+        self.failed = False
+
+    def register_hooks(self, registry: Any, **kwargs: Any) -> None:
+        registry.add_callback(BeforeToolCallEvent, self.before_tool_call)
+        registry.add_callback(AfterToolCallEvent, self.after_tool_call)
+        registry.add_callback(AfterToolsEvent, self.after_tools)
+
+    def before_tool_call(self, event: Any) -> None:
+        if not _is_join_match((getattr(event, "tool_use", None) or {}).get("name")):
+            return
+        outcome = self._join.outcome
+        if outcome is not None:
+            event.cancel_tool = ALREADY_JOINED_MESSAGE if outcome.joined else JOIN_FAILED_MESSAGE
+            return
+        team = self._next_team()
+        arguments: dict[str, Any] = {"match_id": self._match_id, "name": self._name, "team": team}
+        if self._agent_index is not None:
+            arguments["agent_index"] = self._agent_index
+        self._offered = team
+        event.tool_use["input"] = arguments
+
+    def after_tool_call(self, event: Any) -> None:
+        if not _is_join_match((getattr(event, "tool_use", None) or {}).get("name")):
+            return
+        if getattr(event, "cancel_message", None) or self._join.outcome is not None:
+            return  # a cancelled call never reached the server; a settled join is not reopened
+        result = getattr(event, "result", None)
+        if (
+            result_is_error(result)
+            and not is_connection_lost(result)
+            and join_reason(result) == ALREADY_JOINED_REASON
+        ):
+            return  # a parallel duplicate in the same batch: the call that seated us reports, not this one
+        if self._may_retry_other_team(result):
+            self._last_refusal = join_reason(result)
+            return
+        report_join_result(self._join, result)
+        outcome = self._join.outcome
+        self.failed = outcome is not None and not outcome.joined
+
+    def after_tools(self, event: Any) -> None:
+        if self.failed:
+            event.end_turn = JOIN_FAILED_MESSAGE
+
+    def settle_unanswered(self) -> None:
+        """Call when the agent turn has ended. `auto` waits for the model to try the other team; if it never
+        did, the last refusal seen (`match_full`) is the outcome, not a generic "ended before join_match"."""
+        if self._join.outcome is None and self._last_refusal is not None:
+            self._join.refuse(self._last_refusal)
+
+    def _next_team(self) -> str:
+        if self._team != "auto":
+            return self._team
+        return next((t for t in AUTO_TEAMS if t not in self._tried), AUTO_TEAMS[-1])
+
+    def _may_retry_other_team(self, result: Any) -> bool:
+        """`auto` only: a `match_full` on one team leaves the other one to try."""
+        if self._team != "auto" or self._offered is None or not result_is_error(result):
+            return False
+        if join_reason(result) != RETRY_OTHER_TEAM_REASON:
+            return False
+        self._tried.append(self._offered)
+        return any(t not in self._tried for t in AUTO_TEAMS)
 
 
 class TickCounterHook:

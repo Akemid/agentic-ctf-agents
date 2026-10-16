@@ -6,7 +6,12 @@ It mirrors the server's MCP turn contract v2 (`packages/server/src/mcp/tools.ts`
   (no `grid`, `walls`, `fields` or `flags[].base`);
 - every turn carries a top-level `last_action` (null on the first turn);
 - `routes[]` carry `closest_threat`, never `min_enemy_distance`;
-- `match_over` is `{score, winner, reason}`; action acks are `accepted` / `rejected` with a reason.
+- `match_over` is `{score, winner, reason}`; action acks are `accepted` / `rejected` with a reason;
+- `join_match` takes `agent_index` (0..2, omitted = the lowest free slot). A slot belongs to ONE MCP
+  session and one session is one join. Refusals are tool errors `{reason, detail?}`, checked in the
+  server's order: `invalid_arguments`, `already_joined` (a second join on the same session), then the lobby
+  reasons `unknown_match`, `match_full`, `slot_taken`, `unauthorized` (a disconnected slot owned by ANOTHER
+  subject), `match_already_started`, `match_finished`.
 
 `tests/test_fake_mcp_contract.py` pins this shape independently of the fake.
 """
@@ -19,10 +24,11 @@ from typing import Any
 
 import anyio
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.shared.memory import create_client_server_memory_streams
 from mcp.types import CallToolResult, TextContent
 
+MAX_SLOTS = 3  # `agent_index` is 0..2
 WALLS = [{"x": 1, "y": 1}, {"x": 2, "y": 1}]
 GRID = {"width": 15, "height": 15}
 FIELDS = {"red": {"min_x": 0, "max_x": 6}, "blue": {"min_x": 8, "max_x": 14}, "neutral_x": 7}
@@ -132,6 +138,11 @@ class FakeGame:
         serve_get_map: bool = True,
         reject_actions: str | None = None,
         deadline_misses: bool = False,
+        taken_slots: tuple[tuple[str, int], ...] = (),
+        full: bool = False,
+        started: bool = False,
+        disconnected_slots: tuple[tuple[str, int], ...] = (),
+        known_match: str | None = None,
     ) -> None:
         self.turns = turns
         self.extra_state = state or {}  # merged into every turn's `state` (routes, moves, agents, ...)
@@ -147,6 +158,13 @@ class FakeGame:
         # True: a tick without an accepted action also carries the agent's own `action_rejected(deadline)`
         # event, as the server does when it misses the deadline. False: such a tick reports `unknown`.
         self.deadline_misses = deadline_misses
+        self.taken_slots: set[tuple[str, int]] = set(taken_slots)  # seats held by OTHER players (a lobby)
+        self.full = full  # every seat is taken: joining answers `match_full`
+        self.started = started  # the match already began: joining answers `match_already_started`
+        # seats owned by ANOTHER subject whose owner is disconnected: joining one is `unauthorized`
+        self.disconnected_slots: set[tuple[str, int]] = set(disconnected_slots)
+        self.known_match = known_match  # when set, any other match id is `unknown_match`
+        self.seated: dict[int, tuple[str, int]] = {}  # MCP session id -> (team, agent_index)
         self.tick = 0
         self.joined = False
         self.over = False
@@ -194,6 +212,38 @@ class FakeGame:
                 return [{**rejection, "reason": "deadline"}]
         return []
 
+    def _lowest_free(self, team: str) -> int:
+        return next((i for i in range(MAX_SLOTS) if not self._occupied(team, i)), 0)
+
+    def _occupied(self, team: str, index: int) -> bool:
+        return (team, index) in self.taken_slots or (team, index) in self.disconnected_slots
+
+    def _join_refusal(self, session: int, match_id: str, team: str, agent_index: int | None) -> str | None:
+        """The server's reason for refusing this join, or None when it seats the caller.
+
+        Order, as in the server: invalid_arguments, already_joined, then unknown_match, match_full,
+        slot_taken, unauthorized, match_already_started, match_finished.
+        """
+        if agent_index is not None and not 0 <= agent_index < MAX_SLOTS:
+            return "invalid_arguments"
+        if session in self.seated:
+            return "already_joined"
+        if self.known_match is not None and match_id != self.known_match:
+            return "unknown_match"
+        if self.full or team in self.reject_teams:
+            return "match_full"
+        if agent_index is not None and (team, agent_index) in self.taken_slots:
+            return "slot_taken"
+        if agent_index is None and all(self._occupied(team, i) for i in range(MAX_SLOTS)):
+            return "match_full"
+        if agent_index is not None and (team, agent_index) in self.disconnected_slots:
+            return "unauthorized"
+        if self.started:
+            return "match_already_started"
+        if self.finished:
+            return "match_finished"
+        return None
+
     def _register(self) -> None:
         game = self
 
@@ -214,18 +264,24 @@ class FakeGame:
 
         @self.server.tool()
         def join_match(
-            match_id: str, team: str, agent_index: int | None = None, name: str | None = None
+            ctx: Context,
+            match_id: str,
+            team: str,
+            agent_index: int | None = None,
+            name: str | None = None,
         ) -> Any:
             """Join a match."""
-            game.actions.append(
-                ("join_match", {"match_id": match_id, "name": name or "mcp-fake", "team": team})
-            )
-            if game.finished:
-                return _tool_error("match_finished")
-            if team in game.reject_teams:
-                return _tool_error("match_full")
+            args: dict[str, Any] = {"match_id": match_id, "name": name or "mcp-fake", "team": team}
+            if agent_index is not None:
+                args["agent_index"] = agent_index
+            game.actions.append(("join_match", args))
+            refusal = game._join_refusal(id(ctx.session), match_id, team, agent_index)  # noqa: SLF001
+            if refusal is not None:
+                return _tool_error(refusal)
+            index = agent_index if agent_index is not None else game._lowest_free(team)  # noqa: SLF001
+            game.seated[id(ctx.session)] = (team, index)
+            game.taken_slots.add((team, index))
             game.joined = True
-            index = 0 if agent_index is None else agent_index
             result: dict[str, Any] = {
                 "agent_id": f"{team}-{index + 1}",
                 "team": team,
@@ -326,3 +382,36 @@ def handshake_ok_then_401_on_tool_call(request: httpx.Request) -> httpx.Response
     else:
         result = {}
     return httpx.Response(200, json={"jsonrpc": "2.0", "id": rpc_id, "result": result})
+
+
+def unauthorized_after(n_ok_calls: int):
+    """A minimal MCP server over plain JSON: the first `n_ok_calls` tool calls succeed (every one answers
+    like a successful `join_match`), later ones are 401 (a token revoked mid-match)."""
+    seen = {"calls": 0}
+    join_result = {"agent_id": "red-1", "team": "red", "agent_index": 0, "map": MAP}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content or b"{}")
+        method, rpc_id = body.get("method"), body.get("id")
+        if rpc_id is None:
+            return httpx.Response(202)
+        if method == "tools/call":
+            seen["calls"] += 1
+            if seen["calls"] > n_ok_calls:
+                return httpx.Response(401, json={"error": "invalid_token"})
+            result = {"content": [{"type": "text", "text": json.dumps(join_result)}], "isError": False}
+        elif method == "initialize":
+            result = {
+                "protocolVersion": body["params"]["protocolVersion"],
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "ctf-game", "version": "0"},
+            }
+        elif method == "tools/list":
+            schema = {"type": "object", "properties": {}}
+            names = ("join_match", "wait_for_turn", "move", "tag", "grab_flag", "wait", "get_map")
+            result = {"tools": [{"name": n, "description": n, "inputSchema": schema} for n in names]}
+        else:
+            result = {}
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": rpc_id, "result": result})
+
+    return handler

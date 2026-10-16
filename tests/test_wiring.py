@@ -35,6 +35,16 @@ def request(match_id="m1"):
     )
 
 
+def recording_play(seen):
+    """A play that records its context and takes a seat, like every runtime must."""
+
+    def play(ctx):
+        seen.append(ctx)
+        ctx.join.succeed("red", 0)
+
+    return play
+
+
 def run(runner):
     resp = runner.start(request())
     assert runner.wait(10)
@@ -76,7 +86,7 @@ class TestBuildRunner:
         monkeypatch.setattr(config, "default_ssm_client", lambda: ssm)  # patched after import
         seen = []
         runner = build_runner(
-            App(), seen.append, runtime="x", env={}, token_provider=StaticTokenProvider("t")
+            App(), recording_play(seen), runtime="x", env={}, token_provider=StaticTokenProvider("t")
         )
         assert run(runner)["status"] == "started"
         assert seen[0].config.mcp_url == "https://mcp.example/mcp"
@@ -89,7 +99,7 @@ class TestBuildRunner:
         env = {"CTF_DECIDER_ENDPOINT_PARAM": "/ctf-decider/endpoint-name"}
         runner = build_runner(
             App(),
-            seen.append,
+            recording_play(seen),
             runtime="x",
             env=env,
             token_provider=StaticTokenProvider("t"),
@@ -119,7 +129,7 @@ class TestBuildRunner:
         env = {"CTF_MCP_URL": "http://m/mcp", "CTF_DECIDER_URL": "http://127.0.0.1:8099"}
         runner = build_runner(
             App(),
-            seen.append,
+            recording_play(seen),
             runtime="x",
             env=env,
             token_provider=StaticTokenProvider("t"),
@@ -128,6 +138,14 @@ class TestBuildRunner:
         )
         assert run(runner)["status"] == "started"
         assert seen[0].config.decider_url == "http://127.0.0.1:8099"
+
+    def test_the_join_timeout_is_a_runner_setting_with_a_bounded_default(self):
+        from ctf_common.join import JOIN_TIMEOUT_S
+
+        default = build_runner(App(), lambda ctx: None, runtime="x", env={})
+        custom = build_runner(App(), lambda ctx: None, runtime="x", env={}, join_timeout_s=2.5)
+        assert default._join_timeout_s == JOIN_TIMEOUT_S == 15.0  # noqa: SLF001
+        assert custom._join_timeout_s == 2.5  # noqa: SLF001
 
     def test_the_token_provider_comes_from_the_environment_when_not_injected(self):
         runner = build_runner(App(), lambda ctx: None, runtime="x", env={"CTF_MCP_URL": "http://m"})
@@ -138,7 +156,7 @@ class TestBuildRunner:
         seen = []
         runner = build_runner(
             App(),
-            seen.append,
+            recording_play(seen),
             runtime="x",
             env={"CTF_MCP_URL": "http://m"},
             token_provider=StaticTokenProvider("tok-1"),
