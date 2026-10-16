@@ -139,10 +139,48 @@ def arn_args():
     return [arg for rt in RUNTIMES for arg in ("--runtime-arn", f"{rt}={ARN.format(rt)}")]
 
 
-def run(argv, rig, state_dir, capsys=None):
-    code = fleet.main(["--state-dir", str(state_dir), *argv], client_factory=rig.factory, clock=rig.clock)
+@pytest.fixture(autouse=True)
+def no_real_ssm(monkeypatch):
+    """The SSM fallback must never reach AWS from a test: the default factory refuses, tests inject a stub."""
+
+    def refuse(region):
+        raise RuntimeError("tests must not reach SSM")
+
+    monkeypatch.setattr(fleet, "_default_ssm_factory", refuse)
+
+
+def run(argv, rig, state_dir, capsys=None, ssm=None):
+    code = fleet.main(
+        ["--state-dir", str(state_dir), *argv],
+        client_factory=rig.factory,
+        clock=rig.clock,
+        ssm_factory=(lambda region: ssm) if ssm is not None else None,
+    )
     out = capsys.readouterr() if capsys else None
     return code, out
+
+
+SSM_PREFIX = "/ctfagents/runtimes"
+
+
+def ssm_param(runtime):
+    return f"{SSM_PREFIX}/{runtime}/arn"
+
+
+def make_ssm():
+    client = boto3.client("ssm", region_name=REGION, aws_access_key_id="test", aws_secret_access_key="test")
+    stub = Stubber(client)
+    stub.activate()
+    return client, stub
+
+
+def ssm_returns(stub, runtimes, invalid=()):
+    reply = {
+        "Parameters": [{"Name": ssm_param(rt), "Type": "String", "Value": ARN.format(rt)} for rt in runtimes]
+    }
+    if invalid:
+        reply["InvalidParameters"] = [ssm_param(rt) for rt in invalid]
+    stub.add_response("get_parameters", reply, {"Names": [ssm_param(rt) for rt in [*runtimes, *invalid]]})
 
 
 def payloads(expected):
@@ -848,3 +886,341 @@ class TestStateSafety:
             assert rig.invoked == 0
         thread.join(5)
         assert result == [0] and rig.invoked == 1
+
+
+class TestSsmRuntimeArnFallback:
+    """`/ctfagents/runtimes/<runtime>/arn` (published by the stack) fills what deployed-state lacks."""
+
+    def test_arns_come_from_ssm_when_there_is_no_deployed_state_file(self, rig, state_dir, tmp_path):
+        client, stub = make_ssm()
+        ssm_returns(stub, ["harness"])
+        rig.invoke("harness")
+        code, _ = run(
+            [
+                "start",
+                "--match",
+                "m1",
+                "--agent",
+                "harness=1",
+                "--deployed-state",
+                str(tmp_path / "no.json"),
+                "--yes",
+            ],
+            rig,
+            state_dir,
+            ssm=client,
+        )
+        assert code == 0
+        stub.assert_no_pending_responses()
+        saved = json.loads((state_dir / "m1.json").read_text())
+        assert saved["sessions"][0]["runtime_arn"] == ARN.format("harness")
+
+    def test_ssm_is_asked_only_for_what_deployed_state_does_not_have(self, rig, state_dir, tmp_path):
+        state = TestRuntimeArns().write_deployed_state(tmp_path / ".cli", runtimes=["harness"])
+        client, stub = make_ssm()
+        ssm_returns(stub, ["decider_loop"])  # the Names expectation proves harness is not requested
+        rig.invoke("harness")
+        rig.invoke("decider_loop")
+        code, _ = run(
+            [
+                "start",
+                "--match",
+                "m1",
+                "--agent",
+                "harness=1",
+                "--agent",
+                "decider_loop=1",
+                "--deployed-state",
+                str(state),
+                "--yes",
+            ],
+            rig,
+            state_dir,
+            ssm=client,
+        )
+        assert code == 0
+        stub.assert_no_pending_responses()
+
+    def test_explicit_overrides_and_deployed_state_win_and_ssm_is_not_called(self, rig, state_dir, arn_args):
+        rig.invoke("harness")
+
+        def must_not_be_called(region):
+            raise AssertionError("SSM was consulted although every ARN was already known")
+
+        code = fleet.main(
+            [
+                "--state-dir",
+                str(state_dir),
+                "start",
+                "--match",
+                "m1",
+                "--agent",
+                "harness=1",
+                *arn_args,
+                "--yes",
+            ],
+            client_factory=rig.factory,
+            clock=rig.clock,
+            ssm_factory=must_not_be_called,
+        )
+        assert code == 0
+
+    def test_a_runtime_missing_from_ssm_too_is_rejected_by_name_before_any_invocation(
+        self, rig, state_dir, tmp_path, capsys
+    ):
+        client, stub = make_ssm()
+        ssm_returns(stub, [], invalid=["decider_loop"])
+        code, out = run(
+            [
+                "start",
+                "--match",
+                "m1",
+                "--agent",
+                "decider_loop=1",
+                "--deployed-state",
+                str(tmp_path / "no.json"),
+                "--yes",
+            ],
+            rig,
+            state_dir,
+            capsys,
+            ssm=client,
+        )
+        assert code == 2 and rig.invoked == 0
+        assert "decider_loop" in out.err and ssm_param("decider_loop") in out.err
+        assert "--runtime-arn" in out.err  # the way out is still explained
+
+    def test_an_ssm_access_error_is_a_clean_rejection_not_a_traceback(self, rig, state_dir, tmp_path, capsys):
+        client, stub = make_ssm()
+        stub.add_client_error("get_parameters", service_error_code="AccessDeniedException")
+        code, out = run(
+            [
+                "start",
+                "--match",
+                "m1",
+                "--agent",
+                "harness=1",
+                "--deployed-state",
+                str(tmp_path / "no.json"),
+                "--yes",
+            ],
+            rig,
+            state_dir,
+            capsys,
+            ssm=client,
+        )
+        assert code == 2 and "AccessDeniedException" in out.err and rig.invoked == 0
+
+    def test_a_target_ambiguity_in_deployed_state_is_still_an_error_not_a_silent_ssm_fallback(
+        self, rig, state_dir, tmp_path, capsys
+    ):
+        state = TestRuntimeArns().write_deployed_state(tmp_path / ".cli", targets=("default", "other"))
+        code, out = run(
+            ["start", "--match", "m1", "--agent", "harness=1", "--deployed-state", str(state), "--yes"],
+            rig,
+            state_dir,
+            capsys,
+        )
+        assert code == 2 and "--target" in out.err
+
+    def test_the_ssm_region_can_be_chosen(self, rig, state_dir, tmp_path):
+        regions = []
+        client, stub = make_ssm()
+        ssm_returns(stub, ["harness"])
+        rig.invoke("harness")
+        code = fleet.main(
+            [
+                "--state-dir",
+                str(state_dir),
+                "start",
+                "--match",
+                "m1",
+                "--agent",
+                "harness=1",
+                "--deployed-state",
+                str(tmp_path / "no.json"),
+                "--region",
+                "us-west-2",
+                "--yes",
+            ],
+            client_factory=rig.factory,
+            clock=rig.clock,
+            ssm_factory=lambda region: regions.append(region) or client,
+        )
+        assert code == 0 and regions == ["us-west-2"]
+
+
+class TestSlotTargeting:
+    """`--team` + `--agent-index` (`--slot` is an equivalent option): start a character in an exact seat."""
+
+    def test_a_slot_names_the_character_after_its_seat_and_goes_in_the_payload(self):
+        (c,) = fleet.plan_launch("m1", {"decider_loop": 1}, teams=2, team="red", agent_index=1)
+        assert (c.name, c.team, c.agent_index) == ("decider-loop-red-2", "red", 1)
+        assert fleet.build_payload(c)["agent_index"] == 1 and fleet.build_payload(c)["team"] == "red"
+
+    def test_without_a_slot_the_payload_has_no_slot_key(self):
+        (c,) = fleet.plan_launch("m1", {"harness": 1}, teams=2)
+        assert "agent_index" not in fleet.build_payload(c) and c.agent_index is None
+
+    def test_an_explicit_team_without_a_slot_applies_to_every_character(self):
+        plan = fleet.plan_launch("m1", {"harness": 2, "harness_sdk": 1}, teams=2, team="blue")
+        assert {c.team for c in plan} == {"blue"} and [c.name for c in plan][0] == "harness-1"
+
+    @pytest.mark.parametrize("team", [None, "auto"])
+    def test_a_slot_needs_an_explicit_team(self, team):
+        with pytest.raises(fleet.LaunchError, match="--agent-index needs --team red or --team blue"):
+            fleet.plan_launch("m1", {"harness": 1}, teams=2, team=team, agent_index=0)
+
+    @pytest.mark.parametrize("slot", [-1, 3])
+    def test_a_slot_out_of_range_is_rejected(self, slot):
+        with pytest.raises(fleet.LaunchError, match="agent_index must be between 0 and 2"):
+            fleet.plan_launch("m1", {"harness": 1}, teams=2, team="red", agent_index=slot)
+
+    def test_a_slot_targets_exactly_one_character(self):
+        with pytest.raises(fleet.LaunchError, match="exactly one character"):
+            fleet.plan_launch("m1", {"harness": 2}, teams=2, team="red", agent_index=0)
+
+    @pytest.mark.parametrize("runtime", RUNTIMES)
+    @pytest.mark.parametrize("team", ["red", "blue"])
+    def test_the_slot_payload_is_accepted_by_the_runtime_parser(self, runtime, team):
+        (c,) = fleet.plan_launch("m1", {runtime: 1}, teams=2, team=team, agent_index=2)
+        request = parse_payload(fleet.build_payload(c), runtime=runtime, session_id=c.session_id)
+        assert (request.team, request.agent_index) == (team, 2)
+        assert len(c.name) <= 21  # the server's name limit
+
+    def test_the_cli_sends_team_and_slot_and_prints_the_seat_the_runtime_assigned(
+        self, rig, state_dir, arn_args, capsys
+    ):
+        expected = rig.invoke(
+            "decider_loop",
+            reply={
+                "status": "started",
+                "match_id": "m1",
+                "name": "decider-loop-red-2",
+                "team": "red",
+                "agent_index": 1,
+            },
+        )
+        code, out = run(
+            [
+                "start",
+                "--match",
+                "m1",
+                "--agent",
+                "decider_loop=1",
+                "--team",
+                "red",
+                "--agent-index",
+                "1",
+                *arn_args,
+                "--yes",
+            ],
+            rig,
+            state_dir,
+            capsys,
+        )
+        assert code == 0
+        sent = payloads([expected])[0]
+        assert (sent["team"], sent["agent_index"], sent["name"]) == ("red", 1, "decider-loop-red-2")
+        assert "decider-loop-red-2: ok (started) team red agent_index 1" in out.out
+        saved = json.loads((state_dir / "m1.json").read_text())["sessions"][0]
+        assert (saved["team"], saved["agent_index"]) == ("red", 1)
+
+    def test_the_recorded_team_is_the_one_the_server_assigned_not_the_planned_one(
+        self, rig, state_dir, arn_args, capsys
+    ):
+        rig.invoke("harness", reply={"status": "started", "team": "blue", "agent_index": 0})
+        code, out = run(
+            ["start", "--match", "m1", "--agent", "harness=1", *arn_args, "--yes"], rig, state_dir, capsys
+        )
+        saved = json.loads((state_dir / "m1.json").read_text())["sessions"][0]
+        assert code == 0 and (saved["team"], saved["agent_index"]) == ("blue", 0)  # planned red, seated blue
+        assert "team blue agent_index 0" in out.out
+
+    def test_a_taken_slot_is_reported_with_the_reason_and_exits_non_zero(
+        self, rig, state_dir, arn_args, capsys
+    ):
+        rig.invoke("harness", reply={"status": "rejected", "error": "join_match failed: slot_taken"})
+        code, out = run(
+            [
+                "start",
+                "--match",
+                "m1",
+                "--agent",
+                "harness=1",
+                "--team",
+                "blue",
+                "--agent-index",
+                "2",
+                *arn_args,
+                "--yes",
+            ],
+            rig,
+            state_dir,
+            capsys,
+        )
+        assert code == 1 and "join_match failed: slot_taken" in out.err
+        saved = json.loads((state_dir / "m1.json").read_text())["sessions"][0]
+        assert saved["ack"] == "failed" and "slot_taken" in saved["error"]
+
+    def test_a_slot_without_a_team_is_rejected_before_any_invocation(self, rig, state_dir, arn_args, capsys):
+        code, out = run(
+            ["start", "--match", "m1", "--agent", "harness=1", "--agent-index", "1", *arn_args, "--yes"],
+            rig,
+            state_dir,
+            capsys,
+        )
+        assert code == 2 and "--team" in out.err and rig.invoked == 0
+
+    def test_the_dry_run_shows_the_seat(self, rig, state_dir, arn_args, capsys):
+        code, out = run(
+            [
+                "start",
+                "--match",
+                "m1",
+                "--agent",
+                "harness=1",
+                "--team",
+                "red",
+                "--agent-index",
+                "0",
+                *arn_args,
+            ],
+            rig,
+            state_dir,
+            capsys,
+        )
+        assert code == 0 and "harness-red-1" in out.out and "agent_index 0" in out.out
+
+    def test_slot_is_an_equivalent_option_to_agent_index(self, rig, state_dir, arn_args, capsys):
+        expected = rig.invoke(
+            "harness", reply={"status": "started", "team": "red", "agent_index": 1, "slot": 1}
+        )
+        code, _ = run(
+            [
+                "start",
+                "--match",
+                "m1",
+                "--agent",
+                "harness=1",
+                "--team",
+                "red",
+                "--slot",
+                "1",
+                *arn_args,
+                "--yes",
+            ],
+            rig,
+            state_dir,
+            capsys,
+        )
+        sent = payloads([expected])[0]
+        assert code == 0 and sent["agent_index"] == 1 and "slot" not in sent
+
+    def test_a_reply_with_only_slot_is_still_recorded(self, rig, state_dir, arn_args, capsys):
+        rig.invoke("harness", reply={"status": "started", "team": "blue", "slot": 2})
+        code, out = run(
+            ["start", "--match", "m1", "--agent", "harness=1", *arn_args, "--yes"], rig, state_dir, capsys
+        )
+        saved = json.loads((state_dir / "m1.json").read_text())["sessions"][0]
+        assert code == 0 and saved["agent_index"] == 2 and "agent_index 2" in out.out
