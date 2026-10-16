@@ -1,0 +1,12 @@
+# Direct runtime dependencies of the decider image. The lock (requirements.lock) is generated from this file:
+#   uv pip compile requirements.in --generate-hashes --python-version 3.11 --python-platform x86_64-manylinux_2_28 \
+#     --index-url https://pypi.org/simple --extra-index-url https://download.pytorch.org/whl/cu126 \
+#     --index-strategy unsafe-best-match --no-header -o requirements.lock
+# torch: newest release with a CUDA 12.x wheel (cu126), the exact build the decider was validated with locally.
+torch==2.14.1+cu126
+# transformers: the exact version validated locally; strands-decider only asks for >=5.15,<6.
+transformers==5.19.0
+strands-decider==0.1.0
+fastapi==0.143.1
+uvicorn==0.54.0
+httpx==0.28.1
