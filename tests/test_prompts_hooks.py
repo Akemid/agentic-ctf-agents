@@ -82,6 +82,24 @@ class TestPrompts:
         assert f"on team {team}" in text and "whichever" not in text
         assert "match m1" in text and "'p1'" in text and text.endswith("until you receive match_over.")
 
+    @pytest.mark.parametrize(("slot", "seat"), [(0, "seat 1"), (1, "seat 2"), (2, "seat 3")])
+    def test_instruction_mentions_the_seat_for_a_requested_slot(self, slot, seat):
+        text = prompts.build_instruction("m1", "p1", "blue", slot)
+        assert f"on team blue, {seat}" in text and text.endswith("until you receive match_over.")
+
+    def test_instruction_without_a_slot_is_unchanged(self):
+        assert prompts.build_instruction("m1", "p1", "red", None) == prompts.build_instruction(
+            "m1", "p1", "red"
+        )
+
+    def test_seated_instruction_says_the_join_is_done_and_carries_the_join_result(self):
+        joined = {"agent_id": "blue-3", "team": "blue", "agent_index": 2, "map": {"grid": {"width": 15}}}
+        text = prompts.build_seated_instruction("m1", "p1", joined)
+        assert "already joined match m1" in text and "team blue" in text and "seat 3" in text
+        assert "do not call join_match" in text.lower()
+        assert json.dumps(joined, separators=(",", ":")) in text  # the map reaches the model once, here
+        assert text.endswith("until you receive match_over.")
+
     def test_instruction_rejects_unknown_team(self):
         with pytest.raises(ValueError, match="team"):
             prompts.build_instruction("m1", "p1", "green")

@@ -1,13 +1,26 @@
-"""One match per process: the async start / status / stop state machine (design A2).
+"""One match per process: the start / status / stop state machine (design A2).
 
 There is one runner per process, which is one microVM per AgentCore session.
 
-    IDLE/FINISHED/FAILED/STOPPED --start--> STARTING (preflight, lock NOT held; reported as "running")
+    IDLE/FINISHED/FAILED/STOPPED --start--> STARTING (preflight + join, lock NOT held; reported as "running")
       STARTING --preflight error--> FAILED        STARTING --stop--> STOPPING --preflight done--> STOPPED
-      STARTING --ok--> RUNNING --play returns--> FINISHED     RUNNING --exception--> FAILED
+      STARTING --joined--> RUNNING --play returns--> FINISHED     RUNNING --exception--> FAILED
+      STARTING --join refused/error--> FAILED at once (the old thread may still be unwinding)
+      STARTING --join timeout--> STOPPING --play exits--> FAILED
       RUNNING --stop--> STOPPING --play exits--> STOPPED
+      STARTING --stop during join--> STOPPING --play exits--> STOPPED
     start while STARTING/RUNNING: same (match_id, name) -> already_running; different -> rejected
     start while STOPPING -> rejected. Restart after a terminal state is allowed (spec: Restart after finish).
+
+`start` is synchronous up to the seat: after the preflight it runs the match thread, which opens the MCP
+connection and calls `join_match`, and `start` waits (bounded) for that outcome on a `JoinSignal` before
+answering `started` (with the team/agent_index it assigned), `rejected` (the server refused the seat) or
+`failed` (infrastructure error or timeout). The join runs on the match thread, not on `start`, because the
+server binds the seat to one MCP session and the match must keep playing on that same session.
+
+Every start bumps a run generation. A thread of an older run (for example one still unwinding after a
+refusal) can only write state while its generation is still the current one, so `status` reports the refusal
+at once and a restart is never overwritten by a thread that is finishing late.
 
 `start` registers the match with `app.add_async_task` (the session reports HealthyBusy) and
 runs it on a daemon thread. `complete_async_task` always runs in `finally`.
@@ -19,13 +32,14 @@ import contextvars
 import logging
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Protocol
 
 from .auth import PrefetchedTokenProvider, TokenProvider
 from .config import RuntimeConfig
+from .join import JOIN_TIMEOUT_S, JoinOutcome, JoinSignal
 from .payload import Action, MatchRequest, PayloadError, parse_payload
 
 log = logging.getLogger("ctf_common.runner")
@@ -66,13 +80,19 @@ PreflightFn = Callable[[MatchRequest], Preflight]
 
 @dataclass(frozen=True)
 class MatchContext:
-    """Everything a PlayFn gets. `stop` is set when an operator asks the match to end."""
+    """Everything a PlayFn gets. `stop` is set when an operator asks the match to end.
+
+    `join` is how the play function answers `start`: it MUST report the outcome of `join_match` (the
+    seat the server assigned, or why it refused) before playing. A play that ends without reporting is
+    treated as a failed join.
+    """
 
     request: MatchRequest
     config: RuntimeConfig
     tokens: TokenProvider
     stop: threading.Event
     tick: Callable[[], None]
+    join: JoinSignal = field(default_factory=JoinSignal)
 
 
 class PlayFn(Protocol):
@@ -91,8 +111,19 @@ def make_preflight(load_config: Callable[[], RuntimeConfig], tokens: TokenProvid
 
 
 class MatchRunner:
-    def __init__(self, app: AsyncTaskApp, play: PlayFn, preflight: PreflightFn, *, runtime: str) -> None:
+    def __init__(
+        self,
+        app: AsyncTaskApp,
+        play: PlayFn,
+        preflight: PreflightFn,
+        *,
+        runtime: str,
+        join_timeout_s: float = JOIN_TIMEOUT_S,
+    ) -> None:
         self._app = app
+        self._join_timeout_s = join_timeout_s
+        self._join: JoinSignal | None = None
+        self._seat: JoinOutcome | None = None
         self._play = play
         self._preflight = preflight
         self._runtime = runtime
@@ -104,15 +135,16 @@ class MatchRunner:
         self._error: str | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._generation = 0  # bumped by every start: only the current run's thread may write state
 
     # ---- public API ------------------------------------------------------
 
     def start(self, request: MatchRequest) -> dict[str, Any]:
-        """Register the match, run the (network) preflight WITHOUT the lock, then launch the thread.
+        """Run the (network) preflight WITHOUT the lock, launch the match thread, wait for its join.
 
-        While the preflight runs the runner is in the internal STARTING state, which is reported
-        externally as `running` (the spec's status set is unchanged). `status` and `stop` never wait
-        on the preflight.
+        While the preflight and the join run the runner is in the internal STARTING state, which is
+        reported externally as `running` (the spec's status set is unchanged). `status` and `stop` never
+        wait on either, and neither holds the lock.
         """
         with self._lock:
             if self._state in _ACTIVE:
@@ -128,6 +160,10 @@ class MatchRunner:
             self._error = None
             self._stop = threading.Event()
             self._thread = None
+            self._join = None
+            self._seat = None
+            self._generation += 1
+            generation = self._generation
             self._state = MatchState.STARTING
 
         try:
@@ -146,19 +182,21 @@ class MatchRunner:
                 )
             except Exception as exc:  # noqa: BLE001
                 return self._fail_start_locked(exc)
+            join = JoinSignal()
             context = MatchContext(
                 request=request,
                 config=prepared.config,
                 tokens=prepared.tokens,
                 stop=self._stop,
-                tick=self._count_tick,
+                tick=lambda: self._count_tick(generation),
+                join=join,
             )
             # copy_context: the request-scoped workload-identity ContextVar must reach the worker thread.
             ctx = contextvars.copy_context()
             try:
                 thread = threading.Thread(
                     target=ctx.run,
-                    args=(self._run, context, task_id),
+                    args=(self._run, context, task_id, generation),
                     name=f"match-{request.name}",
                     daemon=True,
                 )
@@ -167,8 +205,9 @@ class MatchRunner:
                 self._app.complete_async_task(task_id)
                 return self._fail_start_locked(exc)
             self._thread = thread
-            self._state = MatchState.RUNNING
-            return self._snapshot("started")
+            self._join = join  # the state stays STARTING until the join answers
+
+        return self._await_join(join, generation)
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -179,6 +218,8 @@ class MatchRunner:
             if self._state in (MatchState.STARTING, MatchState.RUNNING):
                 self._state = MatchState.STOPPING
                 self._stop.set()
+                if self._join is not None:
+                    self._join.cancel()  # wake a `start` that is waiting for a join nobody wants anymore
             return self._snapshot()
 
     def wait(self, timeout: float | None = None) -> bool:
@@ -190,6 +231,46 @@ class MatchRunner:
         return not thread.is_alive()
 
     # ---- internals -------------------------------------------------------
+
+    def _await_join(self, join: JoinSignal, generation: int) -> dict[str, Any]:
+        """Wait (bounded, lock NOT held) for `join_match`, then answer `start` from what the server said."""
+        outcome = join.wait(self._join_timeout_s)
+        timed_out = outcome is None
+        if outcome is None:
+            outcome = join.expire(f"join_match timed out after {self._join_timeout_s:g}s")
+            if outcome.kind == "error":
+                # Nobody answered in time: end the thread (the stop event) but keep the runner busy until
+                # it exits, so a restart can never overlap a thread that may still hold a seat.
+                with self._lock:
+                    if self._state is MatchState.STARTING:
+                        self._state = MatchState.STOPPING
+                    self._stop.set()
+        if outcome.joined:
+            with self._lock:
+                if generation != self._generation:
+                    return self._snapshot()
+                self._seat = outcome
+                if self._state is MatchState.STARTING:
+                    self._state = MatchState.RUNNING
+                    return self._snapshot("started")
+                return self._snapshot()  # a stop raced the join: report the stop, not a started match
+        if outcome.kind == "cancelled":
+            return self.status()  # an operator stop: report it now, the thread unwinds on its own
+        # refused (the server said no) or error (could not join)
+        status = "rejected" if outcome.kind == "refused" else "failed"
+        with self._lock:
+            if generation != self._generation:  # a newer run owns the runner: answer, do not touch it
+                return {"status": status, "error": _join_error(outcome)}
+            if timed_out:
+                # The thread may be stuck holding the seat: the runner stays STOPPING (busy) until it exits.
+                if not self._error:
+                    self._error = outcome.reason
+            else:
+                # Refused or errored: no seat is held and the thread is only unwinding, so the runner is
+                # terminal now (a restart is allowed; the generation keeps the old thread from writing).
+                self._state = MatchState.FAILED
+                self._error = _join_error(outcome)
+            return self._snapshot(status)
 
     def _finish_start(self, state: MatchState, *, error: BaseException) -> dict[str, Any]:
         with self._lock:
@@ -203,24 +284,37 @@ class MatchRunner:
         self._error = _describe(error)
         return self._snapshot()
 
-    def _run(self, context: MatchContext, task_id: int) -> None:
+    def _run(self, context: MatchContext, task_id: int, generation: int) -> None:
         outcome, error = MatchState.FINISHED, None
         try:
             self._play(context)
         except Exception as exc:  # noqa: BLE001 - a failed match is reported via status
             log.error("match failed: %s", _describe(exc))
             outcome, error = MatchState.FAILED, _describe(exc)
+            context.join.error(_describe(exc))  # no-op when the join already answered
         else:
             if context.stop.is_set():
                 outcome = MatchState.STOPPED
+                context.join.cancel()
+            else:
+                context.join.error("the match ended before join_match completed")
         finally:
+            seat = context.join.outcome
+            if seat is not None and seat.kind in ("refused", "error"):
+                # A failed join wins over a stop that raced it. The error is the thread's own exception when
+                # there is one (a 401 after `connection_lost` is the real cause); else the join verdict.
+                outcome = MatchState.FAILED
+                if error is None or seat.kind == "refused":
+                    error = _join_error(seat)
             with self._lock:
-                self._state, self._error = outcome, error
+                if generation == self._generation:  # a newer run must never be overwritten by this thread
+                    self._state, self._error = outcome, error
             self._app.complete_async_task(task_id)
 
-    def _count_tick(self) -> None:
+    def _count_tick(self, generation: int) -> None:
         with self._lock:
-            self._ticks += 1
+            if generation == self._generation:
+                self._ticks += 1
 
     def _snapshot(self, status: str | None = None) -> dict[str, Any]:
         if self._state is MatchState.IDLE and status is None:
@@ -231,13 +325,20 @@ class MatchRunner:
             "status": status or _external(self._state),
             "match_id": request.match_id,
             "name": request.name,
-            "team": request.team,
+            "team": request.team if self._seat is None else self._seat.team,
             "started_at": self._started_at,
             "ticks": self._ticks,
         }
+        if self._seat is not None:
+            snap["agent_index"] = self._seat.agent_index
+            snap["slot"] = self._seat.agent_index  # equivalent key, the web lobby reads it
         if self._error:
             snap["error"] = self._error
         return snap
+
+
+def _join_error(seat: JoinOutcome) -> str | None:
+    return f"join_match failed: {seat.reason}" if seat.kind == "refused" else seat.reason
 
 
 def _external(state: MatchState) -> str:

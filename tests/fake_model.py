@@ -17,8 +17,15 @@ def _last_tool_result_text(messages: list[dict]) -> str | None:
     return None
 
 
+def _first_user_text(messages: list[dict]) -> str:
+    for block in messages[0].get("content", []) if messages else []:
+        if isinstance(block.get("text"), str):
+            return block["text"]
+    return ""
+
+
 class ScriptedPlayer(Model):
-    """join_match -> wait_for_turn -> move -> wait_for_turn ... until match_over, then a final text."""
+    """join_match (unless the runtime joined in code) -> wait_for_turn -> move -> ... until match_over."""
 
     def __init__(self, join_args: dict[str, Any] | None = None) -> None:
         self.calls: list[list[dict]] = []  # a snapshot of the messages for every model call
@@ -38,6 +45,8 @@ class ScriptedPlayer(Model):
     def _decide(self, messages: list[dict]) -> tuple[str, dict[str, Any]] | str:
         text = _last_tool_result_text(messages)
         if text is None:
+            if "already joined" in _first_user_text(messages):  # the runtime joined in code: just play
+                return ("ctf-game_wait_for_turn", {})
             return ("ctf-game_join_match", self.join_args)
         payload = json.loads(text) if text.startswith("{") else {}
         # v2 contract: a join result has no `status` (it has `agent_id`); an action ack is accepted/rejected.

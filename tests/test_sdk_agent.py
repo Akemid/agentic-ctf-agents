@@ -17,7 +17,7 @@ from ctf_common.payload import Action, MatchRequest
 from ctf_common.prompts import SYSTEM_PROMPT
 from ctf_common.runner import MatchContext
 from fake_mcp import FakeGame, handshake_ok_then_401_on_tool_call, in_memory_transport
-from fake_model import ScriptedPlayer
+from fake_model import ScriptedPlayer, SequencePlayer
 
 APP_DIR = Path(__file__).resolve().parents[1] / "app" / "harness_sdk"
 TIMEOUT = 20
@@ -32,10 +32,16 @@ class CountingTokens:
         return f"token-{self.calls}"
 
 
-def make_ctx(tokens=None, *, team="auto", options=None, on_tick=None, stop=None):
+def make_ctx(tokens=None, *, team="auto", options=None, on_tick=None, stop=None, agent_index=None):
     ticks = []
     request = MatchRequest(
-        action=Action.START, match_id="m1", name="p1", team=team, model="haiku", options=options or {}
+        action=Action.START,
+        match_id="m1",
+        name="p1",
+        team=team,
+        model="haiku",
+        options=options or {},
+        agent_index=agent_index,
     )
 
     def tick():
@@ -71,19 +77,69 @@ class TestPlayLoop:
         assert [m["tick"] for m in moves] == [1, 2, 3]
         assert len(ticks) == 3
 
-    def test_joins_with_the_requested_match_and_name(self):
+    def test_the_runtime_joins_in_code_with_the_requested_match_and_name(self):
         game, (ctx, _) = FakeGame(turns=1), make_ctx()
-        model = play_against(game, ctx, ScriptedPlayer({"match_id": "m1", "name": "p1", "team": "red"}))
+        model = play_against(game, ctx)
         first_user = model.calls[0][0]
         assert first_user["role"] == "user"
         text = first_user["content"][0]["text"]
-        assert "match m1" in text and "'p1'" in text and "whichever team" in text
+        assert "already joined match m1" in text and "'p1'" in text
         assert game.actions[0] == ("join_match", {"match_id": "m1", "name": "p1", "team": "red"})
+        assert [n for n, _ in game.actions].count("join_match") == 1  # the model never joined
 
-    def test_fixed_team_is_part_of_the_instruction(self):
-        game, (ctx, _) = FakeGame(turns=1), make_ctx(team="blue")
+    def test_fixed_team_and_seat_are_forced_and_part_of_the_instruction(self):
+        game, (ctx, _) = FakeGame(turns=1), make_ctx(team="blue", agent_index=2)
         model = play_against(game, ctx)
-        assert "on team blue" in model.calls[0][0]["content"][0]["text"]
+        assert game.actions[0] == (
+            "join_match",
+            {"match_id": "m1", "name": "p1", "team": "blue", "agent_index": 2},
+        )
+        assert "team blue, seat 3" in model.calls[0][0]["content"][0]["text"]
+        assert (ctx.join.outcome.kind, ctx.join.outcome.team, ctx.join.outcome.agent_index) == (
+            "joined",
+            "blue",
+            2,
+        )
+
+    def test_the_join_result_with_the_map_reaches_the_model_in_the_instruction(self):
+        game, (ctx, _) = FakeGame(turns=1), make_ctx()
+        model = play_against(game, ctx)
+        assert '"flag_bases"' in model.calls[0][0]["content"][0]["text"]
+
+    def test_a_refused_join_never_reaches_the_model_and_never_tries_another_slot(self):
+        game = FakeGame(turns=3, taken_slots=(("red", 1),))
+        ctx, ticks = make_ctx(team="red", agent_index=1)
+        model = play_against(game, ctx)
+        assert model.calls == [] and ticks == []
+        assert [n for n, _ in game.actions] == ["join_match"]
+        assert (ctx.join.outcome.kind, ctx.join.outcome.reason) == ("refused", "slot_taken")
+
+    def test_team_auto_falls_back_to_blue_in_code_only_on_a_full_team(self):
+        game, (ctx, _) = FakeGame(turns=1, reject_teams=("red",)), make_ctx()
+        play_against(game, ctx)
+        assert [a["team"] for n, a in game.actions if n == "join_match"] == ["red", "blue"]
+        assert ctx.join.outcome.team == "blue"
+
+    def test_a_model_initiated_join_is_cancelled_and_does_not_fail_the_match(self):
+        game, (ctx, ticks) = FakeGame(turns=2), make_ctx(team="red", agent_index=1)
+        script = SequencePlayer(
+            [
+                ("ctf-game_join_match", {"match_id": "x", "team": "blue", "name": "evil", "agent_index": 0}),
+                ("ctf-game_wait_for_turn", {}),
+                ("ctf-game_move", {"tick": 1, "direction": "up"}),
+            ]
+        )
+        play_against(game, ctx, script)
+        joins = [a for n, a in game.actions if n == "join_match"]
+        assert joins == [{"match_id": "m1", "name": "p1", "team": "red", "agent_index": 1}]
+        assert ticks == [1] and ctx.join.outcome.kind == "joined"
+
+    def test_a_stop_that_arrived_before_the_join_takes_no_seat_and_never_starts_the_model(self):
+        stop = threading.Event()
+        stop.set()
+        game, (ctx, _) = FakeGame(turns=3), make_ctx(stop=stop)
+        model = play_against(game, ctx)
+        assert model.calls == [] and game.actions == []
 
     def test_history_starts_empty_and_uses_the_shared_system_prompt(self):
         game, (ctx, _) = FakeGame(turns=1), make_ctx()
@@ -126,7 +182,7 @@ class TestPlayLoop:
         game, (ctx, _) = FakeGame(turns=12), make_ctx(options={"window": 8})
         model = play_against(game, ctx)
         assert max(len(call) for call in model.calls) <= 9  # window + pinned instruction
-        assert model.calls[-1][0]["content"][0]["text"].startswith("Join match")
+        assert model.calls[-1][0]["content"][0]["text"].startswith("You have already joined match")
 
     def test_default_window_is_used_when_not_given(self):
         game, (ctx, _) = FakeGame(turns=12), make_ctx()
@@ -173,7 +229,7 @@ class TestMidMatchUnauthorized:
         with pytest.raises(McpAuthError, match="401"):
             sdk_agent.play(ctx, mcp_factory=mcp_factory, model=model)
         assert tokens.calls == 1  # no refresh
-        assert len(model.calls) == 1  # the loop did not go on after the 401
+        assert model.calls == []  # the code-owned join met the 401: the model was never consulted
 
 
 class TestRunnerIntegration:
@@ -213,6 +269,95 @@ class TestRunnerIntegration:
         status = runner.status()
         assert status["status"] == "finished" and status["ticks"] == 4
         assert app.done == [7]
+
+    def start(self, game, **fields):
+        class App:
+            def __init__(self):
+                self.added, self.done = [], []
+
+            def add_async_task(self, name, metadata=None):
+                self.added.append(name)
+                return len(self.added)
+
+            def complete_async_task(self, task_id):
+                self.done.append(task_id)
+                return True
+
+        app = App()
+        runner = sdk_agent.build_runner(
+            app,
+            {"CTF_MCP_URL": "https://mcp.example/mcp"},
+            token_provider=StaticTokenProvider("tok"),
+            play=lambda ctx: play_against(game, ctx),
+        )
+        values = dict(action=Action.START, match_id="m1", name="p1", team="auto", model="haiku", options={})
+        return app, runner, runner.start(MatchRequest(**{**values, **fields}))
+
+    def test_start_answers_with_the_seat_the_server_assigned(self):
+        app, runner, resp = self.start(FakeGame(turns=2), team="blue", agent_index=2)
+        assert resp["status"] == "started"
+        assert (resp["match_id"], resp["name"], resp["team"], resp["agent_index"]) == ("m1", "p1", "blue", 2)
+        assert runner.wait(TIMEOUT) and runner.status()["status"] == "finished"
+        assert app.added == ["match"] and app.done == [1]
+
+    def test_a_payload_with_only_slot_joins_that_exact_index_and_the_response_echoes_slot(self):
+        from ctf_common.payload import parse_payload
+
+        game = FakeGame(turns=1)
+        request = parse_payload(
+            {"match_id": "m1", "team": "blue", "slot": 2}, runtime="harness_sdk", session_id="s"
+        )
+        assert request.agent_index == 2
+        _, runner, resp = self.start(game, team=request.team, agent_index=request.agent_index)
+        assert game.actions[0] == (
+            "join_match",
+            {"match_id": "m1", "name": "p1", "team": "blue", "agent_index": 2},
+        )
+        assert (resp["status"], resp["slot"], resp["agent_index"]) == ("started", 2, 2)
+        runner.wait(TIMEOUT)
+
+    def test_start_with_team_auto_reports_the_team_the_server_picked(self):
+        _, runner, resp = self.start(FakeGame(turns=1, reject_teams=("red",)))
+        assert (resp["status"], resp["team"], resp["agent_index"]) == ("started", "blue", 0)
+        runner.wait(TIMEOUT)
+
+    @pytest.mark.parametrize(
+        ("flags", "reason"),
+        [
+            ({"taken_slots": (("red", 1),)}, "slot_taken"),
+            ({"full": True}, "match_full"),
+            ({"started": True}, "match_already_started"),
+            ({"finished": True}, "match_finished"),
+            ({"disconnected_slots": (("red", 1),)}, "unauthorized"),
+        ],
+    )
+    def test_each_join_refusal_is_a_rejected_start_with_its_reason_and_no_match_is_played(
+        self, flags, reason
+    ):
+        game = FakeGame(turns=3, **flags)
+        app, runner, resp = self.start(game, team="red", agent_index=1)
+        assert resp["status"] == "rejected" and resp["error"] == f"join_match failed: {reason}"
+        assert runner.wait(TIMEOUT) and runner.status()["status"] == "failed"
+        assert [n for n, _ in game.actions] == ["join_match"]  # one attempt: no fallback slot
+        assert app.added == ["match"] and app.done == [1]  # the task balance holds on the failure path
+
+    def test_a_refused_start_can_be_retried_on_another_slot_at_once(self):
+        game = FakeGame(turns=1, taken_slots=(("red", 1),))
+        _, runner, first = self.start(game, team="red", agent_index=1)
+        assert first["status"] == "rejected"
+        second = runner.start(
+            MatchRequest(
+                action=Action.START,
+                match_id="m1",
+                name="p1",
+                team="red",
+                model="haiku",
+                options={},
+                agent_index=2,
+            )
+        )
+        assert second["status"] == "started" and second["agent_index"] == 2
+        runner.wait(TIMEOUT)
 
     def test_preflight_failure_names_the_missing_parameter(self):
         class App:

@@ -7,6 +7,12 @@ carries the `bedrock/` prefix `create_harness` expects, session and memory live 
 
 `create_harness` owns its context manager, which takes precedence over a conversation manager, so
 there is no `window` option for this runtime (same as the original).
+
+Unlike the other runtimes this one cannot join in code: `create_harness` builds and owns the MCP client
+from the `mcp_servers` config, so the seat has to be taken through that same client, by the model's first
+tool call. `ForceJoinArgsHook` overwrites the arguments of that call (match, name, team, agent_index),
+reports the outcome to `start` through `ctx.join`, and ends the turn on a refusal. Because the model has to
+get there (a Bedrock call, a cold start), this runtime waits longer for the join than the code-joined ones.
 """
 
 from __future__ import annotations
@@ -21,13 +27,15 @@ from strands_harness import create_harness
 from ctf_common import wiring
 from ctf_common.auth import TokenProvider
 from ctf_common.config import RuntimeConfig
-from ctf_common.hooks import ConnectionLostHook, StopRequestedHook, TickCounterHook
+from ctf_common.hooks import ConnectionLostHook, ForceJoinArgsHook, StopRequestedHook, TickCounterHook
 from ctf_common.mcp import DEFAULT_SERVER_NAME, raise_on_auth_failure
 from ctf_common.payload import MatchRequest, require_match_id
 from ctf_common.prompts import MODEL_ALIASES, SYSTEM_PROMPT, build_instruction
 from ctf_common.runner import AsyncTaskApp, MatchContext, MatchRunner, PlayFn
 
 RUNTIME = "harness"
+# The model must reach its first tool call (cold start + one Bedrock turn) before the seat exists.
+JOIN_TIMEOUT_S = 30.0
 ENV_STATE_DIR = "CTF_AGENT_STATE_DIR"
 DEFAULT_STATE_DIR = "/tmp/.agent"  # noqa: S108 - the only writable path in an AgentCore microVM
 
@@ -90,7 +98,9 @@ def play(
     """
     request = ctx.request
     connection = ConnectionLostHook()
-    hooks = [TickCounterHook(ctx.tick), StopRequestedHook(ctx.stop), connection]
+    match_id = require_match_id(request)
+    force_join = ForceJoinArgsHook(match_id, request.name, request.team, request.agent_index, ctx.join)
+    hooks = [TickCounterHook(ctx.tick), StopRequestedHook(ctx.stop), connection, force_join]
     kwargs = harness_kwargs(
         request,
         ctx.config,
@@ -109,7 +119,8 @@ def play(
     with raise_on_auth_failure():
         agent = create(**kwargs)
         try:
-            agent(build_instruction(require_match_id(request), request.name, request.team))
+            agent(build_instruction(match_id, request.name, request.team, request.agent_index))
+            force_join.settle_unanswered()  # team:auto, red full, blue never tried: match_full
         finally:
             agent.cleanup()  # stops the MCP client; a 401 that killed the connection surfaces here
     if connection.lost:
@@ -127,5 +138,11 @@ def build_runner(
 ) -> MatchRunner:
     """Wire the runner. Nothing touches AWS until a `start` arrives (preflight), so /ping stays healthy."""
     return wiring.build_runner(
-        app, play, runtime=RUNTIME, env=env, token_provider=token_provider, ssm_client=ssm_client
+        app,
+        play,
+        runtime=RUNTIME,
+        env=env,
+        token_provider=token_provider,
+        ssm_client=ssm_client,
+        join_timeout_s=JOIN_TIMEOUT_S,
     )

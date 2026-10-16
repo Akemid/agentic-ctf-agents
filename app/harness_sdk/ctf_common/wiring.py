@@ -14,6 +14,7 @@ from typing import Any
 from . import config as _config
 from .auth import AgentCoreM2MTokenProvider, TokenProvider
 from .config import ENV_DECIDER_URL, ENV_MCP_URL, load_config
+from .join import JOIN_TIMEOUT_S
 from .payload import MatchRequest
 from .runner import AsyncTaskApp, MatchRunner, PlayFn, make_preflight
 
@@ -35,6 +36,7 @@ def build_runner(
     ssm_client: Any | None = None,
     ssm_client_factory: Callable[[], Any] | None = None,
     needs_decider: bool = False,
+    join_timeout_s: float = JOIN_TIMEOUT_S,
 ) -> MatchRunner:
     """Wire a `MatchRunner` for one runtime. `ssm_client` / `token_provider` are test seams."""
     environment = os.environ if env is None else env
@@ -50,4 +52,4 @@ def build_runner(
 
         return make_preflight(load, tokens)(request)
 
-    return MatchRunner(app, play, preflight, runtime=runtime)
+    return MatchRunner(app, play, preflight, runtime=runtime, join_timeout_s=join_timeout_s)

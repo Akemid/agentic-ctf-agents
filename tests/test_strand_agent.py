@@ -12,7 +12,7 @@ from ctf_common.decider import DeciderCircuitOpen, HttpDecider, SageMakerDecider
 from ctf_common.mcp import McpAuthError, open_mcp_client
 from ctf_common.payload import Action, MatchRequest
 from ctf_common.runner import MatchContext
-from fake_mcp import FakeGame, handshake_ok_then_401_on_tool_call, in_memory_transport
+from fake_mcp import FakeGame, handshake_ok_then_401_on_tool_call, in_memory_transport, unauthorized_after
 from fake_model import ScriptedPlayer, SequencePlayer
 
 JOIN = ("ctf-game_join_match", {"match_id": "m1", "team": "red", "name": "p1"})
@@ -145,7 +145,7 @@ class TestMatchPlumbing:
 
 
 class TestMidMatchUnauthorized:
-    def test_401_on_a_later_tool_call_fails_the_match_with_an_auth_error_and_no_refresh(self):
+    def test_401_on_the_code_owned_join_fails_the_match_with_an_auth_error_and_no_refresh(self):
         tokens = CountingTokens()
         ctx, _ = make_ctx(tokens)
 
@@ -160,7 +160,24 @@ class TestMidMatchUnauthorized:
         with pytest.raises(McpAuthError, match="401"):
             strand_agent.play(ctx, mcp_factory=mcp_factory, model=model, decider=FakeDecider())
         assert tokens.calls == 1
-        assert len(model.calls) == 1
+        assert model.calls == []  # the join met the 401: the model was never consulted
+
+    def test_401_after_a_successful_join_still_fails_the_match_and_stops_the_loop(self):
+        tokens = CountingTokens()
+        ctx, _ = make_ctx(tokens)
+        transport = httpx.MockTransport(unauthorized_after(1))
+
+        def mcp_factory(url, token_source):
+            factory = lambda headers=None, timeout=None, auth=None: httpx.AsyncClient(  # noqa: E731
+                transport=transport, headers=headers
+            )
+            return open_mcp_client(url, token_source, client_factory=factory)
+
+        model = ScriptedPlayer()
+        with pytest.raises(McpAuthError, match="401"):
+            strand_agent.play(ctx, mcp_factory=mcp_factory, model=model, decider=FakeDecider())
+        assert tokens.calls == 1 and len(model.calls) == 1
+        assert ctx.join.outcome.kind == "joined"  # the seat was real; the failure came later
 
 
 class TestRunner:

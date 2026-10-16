@@ -10,7 +10,7 @@ from strands_harness import create_harness
 
 import harness_agent
 from ctf_common.config import RuntimeConfig
-from ctf_common.hooks import ConnectionLostHook, StopRequestedHook, TickCounterHook
+from ctf_common.hooks import ConnectionLostHook, ForceJoinArgsHook, StopRequestedHook, TickCounterHook
 from ctf_common.mcp import McpAuthError, open_mcp_client
 from ctf_common.payload import Action, MatchRequest
 from ctf_common.prompts import MODEL_ALIASES, SYSTEM_PROMPT
@@ -151,6 +151,52 @@ class TestPlayLoop:
         assert "match m1" in text and "on team blue" in text and "'p1'" in text
         assert game.actions[0] == ("join_match", {"match_id": "m1", "name": "p1", "team": "blue"})
 
+    def test_the_server_sees_the_forced_join_arguments_whatever_the_model_asks_for(self):
+        game, (ctx, _) = FakeGame(turns=1), make_ctx(team="blue", agent_index=2)
+        evil = {"match_id": "evil", "name": "evil", "team": "red", "agent_index": 0}
+        play_against(game, ctx, ScriptedPlayer(evil))
+        assert game.actions[0] == (
+            "join_match",
+            {"match_id": "m1", "name": "p1", "team": "blue", "agent_index": 2},
+        )
+        assert (ctx.join.outcome.kind, ctx.join.outcome.team, ctx.join.outcome.agent_index) == (
+            "joined",
+            "blue",
+            2,
+        )
+
+    def test_the_instruction_mentions_the_seat_but_is_not_load_bearing(self):
+        game, (ctx, _) = FakeGame(turns=1), make_ctx(team="red", agent_index=1)
+        model = play_against(game, ctx)
+        assert "on team red, seat 2" in model.calls[0][0]["content"][0]["text"]
+
+    def test_team_auto_offers_red_and_reports_the_team_the_server_assigned(self):
+        game, (ctx, _) = FakeGame(turns=1), make_ctx()
+        play_against(game, ctx, ScriptedPlayer({"team": "blue"}))  # the model's pick is irrelevant
+        assert game.actions[0][1]["team"] == "red"
+        assert (ctx.join.outcome.team, ctx.join.outcome.agent_index) == ("red", 0)
+
+    def test_a_refused_join_ends_the_loop_and_reports_the_reason_without_trying_another_slot(self):
+        game, (ctx, ticks) = FakeGame(turns=3, taken_slots=(("red", 1),)), make_ctx(team="red", agent_index=1)
+        model = play_against(game, ctx)
+        assert (ctx.join.outcome.kind, ctx.join.outcome.reason) == ("refused", "slot_taken")
+        assert len(model.calls) == 1 and ticks == []
+        assert [n for n, _ in game.actions] == ["join_match"]
+
+    def test_team_auto_with_a_full_red_team_and_no_retry_reports_match_full(self):
+        game = FakeGame(turns=1, taken_slots=(("red", 0), ("red", 1), ("red", 2)))
+        ctx, _ = make_ctx(team="auto")
+        play_against(game, ctx)  # the model gives up after the first refusal instead of trying blue
+        assert [a["team"] for n, a in game.actions if n == "join_match"] == ["red"]
+        assert (ctx.join.outcome.kind, ctx.join.outcome.reason) == ("refused", "match_full")
+
+    def test_a_model_that_never_joins_leaves_the_join_pending_for_the_runner_timeout(self):
+        game, (ctx, _) = FakeGame(turns=1), make_ctx()
+        model = ScriptedPlayer()
+        model._decide = lambda messages: "I will just talk"  # noqa: SLF001 - a model that never calls a tool
+        play_against(game, ctx, model)
+        assert ctx.join.outcome is None and game.actions == []
+
     def test_history_starts_empty_and_the_prompt_includes_the_ctf_instructions(self):
         game, (ctx, _) = FakeGame(turns=1), make_ctx()
         model = play_against(game, ctx)
@@ -178,7 +224,7 @@ class TestPlayLoop:
         seen = []
         play_against(game, ctx, seen=seen)
         kinds = {type(hook) for hook in seen[0]["hooks"]}
-        assert kinds == {TickCounterHook, StopRequestedHook, ConnectionLostHook}
+        assert kinds == {TickCounterHook, StopRequestedHook, ConnectionLostHook, ForceJoinArgsHook}
 
     def test_the_harness_session_and_memory_dirs_are_passed_through(self):
         game, (ctx, _) = FakeGame(turns=1), make_ctx()
@@ -187,6 +233,50 @@ class TestPlayLoop:
         assert seen[0]["session"] == {"dir": "/unused/sessions"} and seen[0]["memory"] == {
             "dir": "/unused/memory"
         }
+
+
+class TestRunnerJoin:
+    def test_the_runner_answers_start_with_the_seat_and_waits_longer_than_the_default_for_the_model(self):
+        class App:
+            def __init__(self):
+                self.done = []
+
+            def add_async_task(self, name, metadata=None):
+                return 3
+
+            def complete_async_task(self, task_id):
+                self.done.append(task_id)
+                return True
+
+        app, game = App(), FakeGame(turns=2)
+        runner = harness_agent.build_runner(
+            app,
+            {"CTF_MCP_URL": MCP_URL},
+            token_provider=CountingTokens(),
+            play=lambda ctx: play_against(game, ctx),
+        )
+        resp = runner.start(make_request(team="red", agent_index=1))
+        assert (resp["status"], resp["team"], resp["agent_index"]) == ("started", "red", 1)
+        assert runner.wait(20) and app.done == [3]
+        assert harness_agent.JOIN_TIMEOUT_S > 15  # the model has to call join_match itself
+
+    def test_a_refused_slot_is_a_rejected_start(self):
+        class App:
+            def add_async_task(self, name, metadata=None):
+                return 1
+
+            def complete_async_task(self, task_id):
+                return True
+
+        game = FakeGame(turns=2, taken_slots=(("red", 1),))
+        runner = harness_agent.build_runner(
+            App(),
+            {"CTF_MCP_URL": MCP_URL},
+            token_provider=CountingTokens(),
+            play=lambda ctx: play_against(game, ctx),
+        )
+        resp = runner.start(make_request(team="red", agent_index=1))
+        assert resp["status"] == "rejected" and resp["error"] == "join_match failed: slot_taken"
 
 
 class McpServer(BaseHTTPRequestHandler):
