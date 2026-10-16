@@ -210,6 +210,20 @@ describe('SSM and outputs', () => {
     });
   });
 
+  test('publishes the fixed endpoint name, with no dependency on any endpoint', () => {
+    template.hasResourceProperties('AWS::SSM::Parameter', {
+      Name: '/ctf-decider/endpoint-name',
+      Type: 'String',
+      Value: 'ctf-decider',
+    });
+    const params = Object.values(template.findResources('AWS::SSM::Parameter')) as {
+      Properties: { Name: string };
+      DependsOn?: unknown;
+    }[];
+    const param = params.find((p) => p.Properties.Name === '/ctf-decider/endpoint-name');
+    expect(param?.DependsOn).toBeUndefined();
+  });
+
   test('exports nothing', () => {
     const outputs = template.toJSON().Outputs ?? {};
     for (const output of Object.values(outputs) as { Export?: unknown }[]) {

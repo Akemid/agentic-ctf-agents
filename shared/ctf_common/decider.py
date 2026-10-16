@@ -284,6 +284,7 @@ class GuardedDecider:
         self.input_tokens = 0
         self.last_latency_ms: float | None = None
         self.last_queue_wait_ms: float | None = None
+        self._unavailable_announced = False  # one INFO line per outage, not one per probe
 
     def ask(
         self, state: Any, questions: Mapping[str, dict[str, Any]], *, deadline_s: float | None = None
@@ -319,6 +320,7 @@ class GuardedDecider:
                         continue
                     break
                 self.breaker.record_success(admission.epoch)
+                self._unavailable_announced = False
                 verdict = True
                 self._log(started, "ok")
                 return answers
@@ -356,6 +358,9 @@ class GuardedDecider:
             self.breaker.record_failure(admission.epoch)
         elif exc.effect is Effect.OPEN_LONG:
             self.breaker.open_for(MISCONFIGURED_COOLDOWN_S, admission.epoch)
+            if not self._unavailable_announced:
+                self._unavailable_announced = True
+                log.info("decider endpoint unavailable (%s); playing on the LLM fallback", type(exc).__name__)
         elif admission.owns_probe:
             self.breaker.release_probe(admission.epoch)
         if isinstance(exc, DeciderRejected):

@@ -2,9 +2,8 @@ import { Annotations, ArnFormat, Stack, type StackProps } from 'aws-cdk-lib';
 import * as ecr from 'aws-cdk-lib/aws-ecr';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as sagemaker from 'aws-cdk-lib/aws-sagemaker';
-import * as ssm from 'aws-cdk-lib/aws-ssm';
 import type { Construct } from 'constructs';
-import { ENDPOINT_NAME, REPOSITORY_NAME, SSM_ENDPOINT_NAME } from './names';
+import { ENDPOINT_NAME, REPOSITORY_NAME } from './names';
 
 export interface DeciderStackProps extends StackProps {
   /** Image tag in the persistent ECR repository. Falls back to context `imageTag`. */
@@ -30,7 +29,8 @@ const DEFAULT_INFERENCE_AMI = 'al2-ami-sagemaker-inference-gpu-3-1';
 
 /**
  * Weekly stack: one GPU endpoint. Everything that must outlive it (image repository, budget)
- * lives in CtfPersistentStack. Nothing is exported: consumers read the endpoint name from SSM.
+ * lives in CtfPersistentStack, including the `/ctf-decider/endpoint-name` parameter: it must exist
+ * whether or not this stack does (the decider is optional). Nothing is exported.
  */
 export class DeciderStack extends Stack {
   constructor(scope: Construct, id: string, props: DeciderStackProps = {}) {
@@ -111,15 +111,9 @@ export class DeciderStack extends Stack {
       ],
     });
 
-    const endpoint = new sagemaker.CfnEndpoint(this, 'Endpoint', {
+    new sagemaker.CfnEndpoint(this, 'Endpoint', {
       endpointName: ENDPOINT_NAME,
       endpointConfigName: config.attrEndpointConfigName,
     });
-
-    const param = new ssm.StringParameter(this, 'EndpointNameParam', {
-      parameterName: SSM_ENDPOINT_NAME,
-      stringValue: ENDPOINT_NAME,
-    });
-    param.node.addDependency(endpoint);
   }
 }

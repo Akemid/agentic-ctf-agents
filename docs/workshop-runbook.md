@@ -86,8 +86,12 @@ Expect `240 minutes` or `4 hours`. If it is shorter, keep matches shorter than t
 
 ## 2. Persistent stack (once)
 
-ECR repository, the CodeBuild image builder and the SageMaker budget ($25/month, alerts at 80% actual and
-100% forecast). It stays between workshops and costs almost nothing.
+ECR repository, the CodeBuild image builder, the SageMaker budget ($25/month, alerts at 80% actual and
+100% forecast) and the SSM parameter `/ctf-decider/endpoint-name`. It stays between workshops and costs almost
+nothing.
+
+**Deploy order.** The parameter used to belong to `DeciderStack`. Deploy this stack only while `DeciderStack` is
+destroyed (or destroy `DeciderStack` first); a parameter owned by both stacks fails the deploy.
 
 ```bash
 cd infra/decider
@@ -119,8 +123,10 @@ aws sagemaker describe-endpoint --endpoint-name ctf-decider --query EndpointStat
 ```
 
 The deploy waits for the endpoint (start-up timeout 1200 s, typically 10 to 20 minutes). It must read
-`InService` before you continue. The stack publishes `/ctf-decider/endpoint-name`, which the decider
-runtimes read when a match starts.
+`InService` before you continue. The decider is optional: the runtimes read `/ctf-decider/endpoint-name` (kept
+by the persistent stack) when a match starts and pass preflight with or without this stack. With the endpoint down
+the first call fails, the client's breaker opens for 300 s, `strand_decider` proceeds ungated and `decider_loop`
+plays on the LLM. Bring the endpoint up mid-match and it is picked up within that 300 s window.
 
 ## 5. Deploy the runtimes (safe path)
 
@@ -254,6 +260,7 @@ Idle sessions end by themselves after 15 minutes and every session after 4 hours
 ```bash
 cd infra/decider
 make destroy-decider                                     # stops the endpoint billing; needs no tag or email
+                                                         # (the endpoint-name parameter stays on purpose)
 aws sagemaker list-endpoints --query 'Endpoints[].EndpointName' --output text   # expect nothing
 ```
 
@@ -280,8 +287,9 @@ aws sagemaker list-endpoints --query 'Endpoints[].EndpointName' --output text   
 | a start is `rejected` with `join_match failed: slot_taken` (or `match_full`, `match_already_started`) | the seat is taken, the team is full or the match began | pick another `--agent-index`/`--team`; nothing was seated |
 | a start fails with `join_match timed out` | the server or the model did not answer within the join timeout | check the MCP URL and the server; retry with a NEW session id (the old session stays HealthyBusy until its thread exits, bounded by the MCP HTTP read timeout of about 300 s; `StopRuntimeSession` forces the recovery) |
 | `InvokeAgentRuntime` says `AccessDenied` for a caller that sends `runtimeUserId` | the role has `InvokeAgentRuntime` but not `InvokeAgentRuntimeForUser` | add `bedrock-agentcore:InvokeAgentRuntimeForUser` on the runtime and `runtime-endpoint/*` |
-| a start reply says `rejected` with an SSM message | the MCP URL or decider parameter is missing | check steps 1 and 4 |
-| decider runtimes fall back to the LLM | endpoint not `InService`, throttled or over its latency budget | check the endpoint status and the runtime logs |
+| a start reply says `rejected` with an SSM message | the MCP URL or decider parameter is missing | check steps 1 and 2 (`/ctf-decider/endpoint-name` is created by the persistent stack) |
+| decider runtimes fall back to the LLM | endpoint absent (DeciderStack destroyed), not `InService`, throttled or over its latency budget | expected when the decider is down; check the endpoint status and the runtime logs. A missing endpoint is retried after 300 s |
+| deploying `CtfPersistentStack` fails because `/ctf-decider/endpoint-name` already exists | `DeciderStack` from before this change still owns it | destroy `DeciderStack`, then deploy the persistent stack |
 | `cdk deploy` of the decider refuses to run | no `IMAGE_TAG` (intentional guard) | pass the tag printed by `make build-image` |
 
 The end-to-end acceptance run is described in `docs/e2e-acceptance.md`.

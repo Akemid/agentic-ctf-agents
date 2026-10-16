@@ -43,6 +43,7 @@ deploy-decider: build
 	$(CDK) deploy DeciderStack -c imageTag=$(IMAGE_TAG)
 
 # MUTATING: stops the endpoint billing. Needs no tag and no email: `cdk destroy` does not validate the
-# stack's error annotations. ECR and the Budget (CtfPersistentStack) stay.
+# stack's error annotations. ECR, the Budget and the /ctf-decider/endpoint-name parameter
+# (CtfPersistentStack) stay, so the decider runtimes keep starting and fall back to the LLM.
 destroy-decider: build
 	$(CDK) destroy DeciderStack
