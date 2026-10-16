@@ -6,6 +6,9 @@ Contract (spec: match-session-lifecycle):
      "match_id": "^[A-Za-z0-9_-]{1,64}$" (required for start),
      "name": sanitized to "^[a-z0-9_-]{1,32}$" (default "<runtime>-<session_id[-6:]>"),
      "team": "red"|"blue"|"auto" (default "auto"),
+     "agent_index": 0|1|2 (optional; the seat inside the team, the same name and range as the server's
+                    `join_match`; needs an explicit team; `slot` is an equivalent, fully supported
+                    key: it is what the web lobby sends),
      "model": "haiku"|"opus"|"nova-lite" (default "haiku"),
      "options": {window|threshold|threat_threshold|llm_budget_ms|safety_margin_ms}}
 
@@ -29,7 +32,8 @@ _NAME_INVALID_RE = re.compile(r"[^a-z0-9_-]")
 TEAMS = ("red", "blue", "auto")
 MODELS = ("haiku", "opus", "nova-lite")
 
-ALLOWED_KEYS = frozenset({"action", "match_id", "team", "name", "model", "options"})
+ALLOWED_KEYS = frozenset({"action", "match_id", "team", "agent_index", "slot", "name", "model", "options"})
+AGENT_INDEX_MAX = 2  # the server's `agent_index` range is 0..2
 HISTORY_KEYS = frozenset(
     {"messages", "tool_results", "history", "chat_history", "conversation", "message_history"}
 )
@@ -77,6 +81,7 @@ class MatchRequest:
     team: str
     model: str
     options: Mapping[str, int | float] = field(default_factory=dict)
+    agent_index: int | None = None  # forwarded to the server's `join_match` unchanged
 
 
 def require_match_id(request: MatchRequest) -> str:
@@ -109,8 +114,17 @@ def parse_payload(
     model = _parse_choice("model", body.get("model", "haiku"), MODELS)
     if allowed_options is None:
         allowed_options = RUNTIME_OPTIONS.get(runtime, frozenset())
+    agent_index = _parse_agent_index(body, team=team)
     options = _parse_options(body.get("options", {}), runtime=runtime, allowed=allowed_options)
-    return MatchRequest(action=action, match_id=match_id, name=name, team=team, model=model, options=options)
+    return MatchRequest(
+        action=action,
+        match_id=match_id,
+        name=name,
+        team=team,
+        model=model,
+        options=options,
+        agent_index=agent_index,
+    )
 
 
 def _unwrap_prompt(raw: Any) -> Mapping[str, Any]:
@@ -177,6 +191,29 @@ def _parse_choice(field_name: str, value: Any, choices: tuple[str, ...]) -> str:
     if not isinstance(value, str) or value not in choices:
         raise PayloadError(f"{field_name} must be one of: {', '.join(choices)}")
     return value
+
+
+def _parse_agent_index(body: Mapping[str, Any], *, team: str) -> int | None:
+    """`agent_index` and `slot` (the web lobby's key) are equivalent, supported keys with one validation.
+
+    Both present must agree. Internally the value is `agent_index`."""
+    if "agent_index" not in body and "slot" not in body:
+        return None
+    values = [(key, body[key]) for key in ("agent_index", "slot") if key in body]
+    for _key, value in values:
+        # bool is an int subclass: `true` must not become seat 1. Errors always name the canonical key.
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= AGENT_INDEX_MAX:
+            raise PayloadError(f"agent_index must be an integer between 0 and {AGENT_INDEX_MAX}")
+    if len(values) == 2 and values[0][1] != values[1][1]:
+        raise PayloadError(
+            f"agent_index and slot differ ({values[0][1]} vs {values[1][1]}); "
+            "they are the same field, send one of them"
+        )
+    if team == "auto":
+        raise PayloadError(
+            "agent_index requires an explicit team (red or blue); team 'auto' cannot target a seat"
+        )
+    return values[0][1]
 
 
 def _parse_options(value: Any, *, runtime: str, allowed: frozenset[str]) -> dict[str, int | float]:
