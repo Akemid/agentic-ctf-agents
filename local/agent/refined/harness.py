@@ -25,7 +25,10 @@ MODELS = {
     "nova-lite": "bedrock/global.amazon.nova-2-lite-v1:0",
 }
 
-def parse_args() -> argparse.Namespace:
+DEFAULT_NAME = "refined-harness"
+
+
+def parse_args(default_name: str = DEFAULT_NAME) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Refined AmazingPlayer CTF agent (strands_harness)."
     )
@@ -42,21 +45,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--name",
-        default="refined-harness",
-        help="Agent name used to join the match (default: refined-harness).",
+        default=default_name,
+        help=f"Agent name used to join the match (default: {default_name}).",
     )
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
+def main(system_prompt: str = SYSTEM_PROMPT, default_name: str = DEFAULT_NAME) -> None:
+    args = parse_args(default_name)
     model_id = MODELS[args.model]
 
     agent = create_harness(
         name=args.name,
         description="A Capture the Flag game agent that plays as a member of a team, connecting via custom MCP server. Direct and tactical decision-making for fast-paced gameplay.",
         model=model_id,
-        instructions=SYSTEM_PROMPT,
+        instructions=system_prompt,
         effort="low",
         mcp_servers={
             "ctf-game": {

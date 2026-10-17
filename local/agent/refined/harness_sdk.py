@@ -85,26 +85,29 @@ def build_instruction(match: str, name: str) -> str:
             "and play by calling wait_for_turn and one action each tick until you receive match_over.")
 
 
-def parse_args() -> argparse.Namespace:
+DEFAULT_NAME = "refined-sdk"
+
+
+def parse_args(default_name: str = DEFAULT_NAME) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Refined AmazingPlayer CTF agent (plain Strands SDK).")
     parser.add_argument("--model", choices=sorted(MODELS.keys()), default="haiku",
                         help="Model to run the agent with (default: haiku).")
     parser.add_argument("--match", default="llm-1", help="Match id to join (default: llm-1).")
-    parser.add_argument("--name", default="refined-sdk",
-                        help="Agent name used to join the match (default: refined-sdk).")
+    parser.add_argument("--name", default=default_name,
+                        help=f"Agent name used to join the match (default: {default_name}).")
     parser.add_argument("--window", type=int, default=DEFAULT_WINDOW,
                         help=f"Conversation window in messages, 4 per tick (default: {DEFAULT_WINDOW}, ~3 ticks).")
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
+def main(system_prompt: str = SYSTEM_PROMPT, default_name: str = DEFAULT_NAME) -> None:
+    args = parse_args(default_name)
     clients = MCPClient.load_servers(MCP_SERVERS, prefix_with_server_name=True)
 
     agent = Agent(
         name=args.name,
         model=MODELS[args.model],
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         tools=clients,  # MCP clients expose their discovered tools to the agent
         conversation_manager=make_conversation_manager(args.window),
     )

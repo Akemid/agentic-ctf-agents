@@ -209,6 +209,97 @@ class DeciderLoopCliTests(unittest.TestCase):
         self.assertEqual(set(questions), {"threat", "route_bad", "action"})
 
 
+class ExplodingDecider:
+    """A decider whose every use fails the test: --llm-only must never touch it."""
+
+    last_latency_ms = None
+
+    def __getattr__(self, name):
+        raise AssertionError(f"decider.{name} used in llm-only mode")
+
+
+class SequenceClient:
+    """MCPClient stand-in: scripted wait_for_turn payloads, every other tool answers {}."""
+
+    def __init__(self, turns):
+        self.turns, self.calls = list(turns), []
+
+    def list_tools_sync(self):
+        return []
+
+    def call_tool_sync(self, tool_use_id, name, arguments):
+        self.calls.append((name, arguments))
+        if name == "wait_for_turn":
+            payload = self.turns.pop(0)
+        elif name == "join_match":
+            payload = {"agent_id": "blue-1", "team": "blue"}
+        else:
+            payload = {}
+        return {"status": "success", "toolUseId": tool_use_id,
+                "content": [{"text": json.dumps(payload)}], "isError": False}
+
+
+class LlmOnlyTests(unittest.TestCase):
+    def parse(self, *argv):
+        old = sys.argv
+        sys.argv = ["decider_loop.py", *argv]
+        try:
+            return dl.parse_args()
+        finally:
+            sys.argv = old
+
+    def play(self, args, ticks=3, llm_result=None, timed_out=False):
+        turns = [{**turn_with([route("enemy_flag_direct", "enemy_flag")], tick=t),
+                  "deadline_remaining_ms": 4000} for t in range(1, ticks + 1)]
+        turns.append({"status": "match_over"})
+        client = SequenceClient(turns)
+        llm_calls = []
+
+        def fake_llm_tick(agent_factory, state, tick, handler=None):
+            llm_calls.append((tick, state))
+            return llm_result if llm_result is not None else (1, ("move", {"direction": "left", "tick": tick}))
+
+        def fake_timeout(fn, timeout_s):
+            return (True, None) if timed_out else (False, fn())
+
+        saved = dl.run_llm_tick, dl.run_with_timeout, dl.Agent
+        dl.run_llm_tick, dl.run_with_timeout, dl.Agent = fake_llm_tick, fake_timeout, lambda **kw: object()
+        try:
+            stats = dl.play(client, ExplodingDecider(), args)
+        finally:
+            dl.run_llm_tick, dl.run_with_timeout, dl.Agent = saved
+        return stats, client, llm_calls
+
+    def test_flag_defaults_off_and_parses(self):
+        self.assertFalse(self.parse().llm_only)
+        self.assertTrue(self.parse("--llm-only").llm_only)
+
+    def test_decider_is_never_used_and_llm_decides_every_tick(self):
+        stats, _, llm_calls = self.play(self.parse("--llm-only"), ticks=3)
+        self.assertEqual([t for t, _ in llm_calls], [1, 2, 3])
+        self.assertEqual((stats.llm_ticks, stats.decider_ticks, stats.budget_ticks), (3, 0, 0))
+
+    def test_llm_gets_the_same_state_text_as_the_fallback_path(self):
+        _, _, llm_calls = self.play(self.parse("--llm-only"), ticks=1)
+        turn = turn_with([route("enemy_flag_direct", "enemy_flag")], tick=1)
+        self.assertEqual(llm_calls[0][1], dl.render_state(turn, dl.Plan(), None, include_last_action=True))
+
+    def test_llm_runs_even_with_less_time_than_the_llm_budget(self):
+        args = self.parse("--llm-only", "--llm-budget-ms", "999999")
+        stats, _, llm_calls = self.play(args, ticks=2)
+        self.assertEqual(len(llm_calls), 2)
+        self.assertEqual(stats.budget_ticks, 0)
+
+    def test_llm_timeout_falls_back_to_wait(self):
+        stats, client, _ = self.play(self.parse("--llm-only"), ticks=2, timed_out=True)
+        self.assertEqual([c for c in client.calls if c[0] == "wait"], [("wait", {"tick": 1}), ("wait", {"tick": 2})])
+        self.assertEqual((stats.llm_ticks, stats.llm_timeouts), (0, 2))
+
+    def test_no_warmup_request_in_llm_only_mode(self):
+        # ExplodingDecider raises on any attribute access, so reaching the end proves no warm-up.
+        self.play(self.parse("--llm-only"), ticks=1)
+
+
 MAP_RAW = {
     "grid": {"width": 15, "height": 15},
     "walls": [{"x": 1, "y": 1}],

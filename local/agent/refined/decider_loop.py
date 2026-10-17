@@ -33,6 +33,11 @@ run, once for that tick, restricted to the action tools. No LLM is involved on t
 
 STRANDS_DECIDER_URL overrides the decider endpoint.
 
+`--llm-only` is an ablation mode: same loop, state rendering, plan continuity and route options,
+but the LLM fallback agent decides every tick and the decider is never consulted (no server
+needed). The LLM runs with whatever time is left (no "not enough time for the LLM" skip) and a
+timed-out tick is a wait, since there is no decider choice to execute. `combine_answers` is unused.
+
 Verified against the live servers (see comments marked VERIFIED / ASSUMPTION):
 
 - VERIFIED  MCP tool names (raw, no prefix, because we call the MCPClient directly):
@@ -1104,23 +1109,33 @@ def warm_up(decider: Decider) -> bool:
     return True
 
 
-def play(client: MCPClient, decider: Decider, args: argparse.Namespace) -> Stats:
+def build_agent_factory(model: str, action_tools: list[Any], system_prompt: str):
+    """Return `handler -> Agent`, the per-tick LLM agent restricted to the action tools."""
+    return lambda handler: Agent(
+        model=model,
+        tools=action_tools,
+        system_prompt=system_prompt,
+        callback_handler=None,
+        interventions=[handler] if handler is not None else [],
+        hooks=[StopAfterActionHook()],  # end the turn after the action: no wasted 2nd model call
+    )
+
+
+def play(client: MCPClient, decider: Decider | None, args: argparse.Namespace,
+         system_prompt: str = SYSTEM_PROMPT) -> Stats:
+    """Run the match loop. With `args.llm_only` the decider is never used (it may be None)."""
+    llm_only = bool(getattr(args, "llm_only", False))
     stats = Stats()
     decider_down = False
     errors = 0
     plan = Plan()
 
     action_tools = [t for t in client.list_tools_sync() if t.tool_name in ACTION_TOOLS]
-    agent_factory = lambda handler: Agent(  # noqa: E731
-        model=MODELS[args.model],
-        tools=action_tools,
-        system_prompt=SYSTEM_PROMPT,
-        callback_handler=None,
-        interventions=[handler] if handler is not None else [],
-        hooks=[StopAfterActionHook()],  # end the turn after the action: no wasted 2nd model call
-    )
+    agent_factory = build_agent_factory(MODELS[args.model], action_tools, system_prompt)
 
-    if not args.no_warmup and not warm_up(decider):
+    if llm_only:
+        print("llm-only mode: decider disabled (no warm-up, no per-tick decider request)")
+    elif not args.no_warmup and not warm_up(decider):
         decider_down = True
 
     _, map_info = join(client, args.match, sanitize_name(args.name))
@@ -1155,7 +1170,7 @@ def play(client: MCPClient, decider: Decider, args: argparse.Namespace) -> Stats
         chosen: str | None = None
         confidence = 0.0
         reason, threat_p, route_bad_p = "choice", 0.0, 0.0
-        if not decider_down:
+        if not decider_down and not llm_only:
             questions = build_questions(options)  # ONE request, three questions
             started = time.monotonic()
             try:
@@ -1174,8 +1189,11 @@ def play(client: MCPClient, decider: Decider, args: argparse.Namespace) -> Stats
                       f"{turn.get('deadline_remaining_ms')} ms")
 
         remaining = turn_remaining_ms(turn, (time.monotonic() - turn_received) * 1000)
-        path = choose_path(chosen, confidence, args.threshold, options, remaining,
-                           args.llm_budget_ms, args.safety_margin_ms, decider_down)
+        if llm_only:
+            path = "llm"  # no decider choice to fall back on: the LLM always runs with the time left
+        else:
+            path = choose_path(chosen, confidence, args.threshold, options, remaining,
+                               args.llm_budget_ms, args.safety_margin_ms, decider_down)
 
         if path in ("decider", "budget"):
             try:
@@ -1209,7 +1227,10 @@ def play(client: MCPClient, decider: Decider, args: argparse.Namespace) -> Stats
             report_outcome(outcome)
             continue
 
-        reason = "decider unavailable" if decider_down else f"low confidence ({chosen}, {confidence:.2f})"
+        if llm_only:
+            reason = "llm-only mode"
+        else:
+            reason = "decider unavailable" if decider_down else f"low confidence ({chosen}, {confidence:.2f})"
         print(f"[tick {tick}] LLM fallback: {reason}")
         stats.llm_ticks += 1
         llm_started = time.monotonic()
@@ -1224,7 +1245,8 @@ def play(client: MCPClient, decider: Decider, args: argparse.Namespace) -> Stats
             stats.llm_ticks -= 1
             stats.llm_timeouts += 1
             waited = f"[tick {tick}] LLM timeout after {(time.monotonic() - llm_started) * 1000:.0f} ms (limit {limit_ms:.0f} ms)"
-            action = timeout_action(chosen, options, decider_down, already_acted)
+            # llm-only: no decider choice exists, so treat the decider as down (-> wait on timeout)
+            action = timeout_action(chosen, options, decider_down or llm_only, already_acted)
             if action == "none":
                 print(f"{waited} -> LLM already executed an action, not sending another")
                 continue
@@ -1261,13 +1283,16 @@ def play(client: MCPClient, decider: Decider, args: argparse.Namespace) -> Stats
 # ---------------------------------------------------------------------------
 
 
-def parse_args() -> argparse.Namespace:
+DEFAULT_NAME = "refined-decider"
+
+
+def parse_args(default_name: str = DEFAULT_NAME) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Refined AmazingPlayer CTF agent with a code-owned loop and strands-decider.")
     parser.add_argument("--model", choices=sorted(MODELS.keys()), default="haiku",
                         help="Model used for the LLM fallback (default: haiku).")
     parser.add_argument("--match", default="llm-1", help="Match id to join (default: llm-1).")
-    parser.add_argument("--name", default="refined-decider",
-                        help="Agent name used to join the match (default: refined-decider; lowercased to fit [a-z0-9_-]).")
+    parser.add_argument("--name", default=default_name,
+                        help=f"Agent name used to join the match (default: {default_name}; lowercased to fit [a-z0-9_-]).")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
                         help=f"Minimum decider confidence to act without the LLM (default: {DEFAULT_THRESHOLD}).")
     parser.add_argument("--threat-threshold", type=float, default=THREAT_YES,
@@ -1278,6 +1303,10 @@ def parse_args() -> argparse.Namespace:
                         help=f"Expected LLM fallback time; skipped when less time is left (default: {DEFAULT_LLM_BUDGET_MS}).")
     parser.add_argument("--safety-margin-ms", type=float, default=DEFAULT_SAFETY_MARGIN_MS,
                         help=f"Extra margin added to the LLM budget (default: {DEFAULT_SAFETY_MARGIN_MS}).")
+    parser.add_argument("--llm-only", action="store_true",
+                        help="Ablation: the LLM fallback agent decides EVERY tick and the decider is never "
+                             "consulted (no server needed). The LLM always runs with the time left, no budget "
+                             "skip; on timeout the tick is a wait. combine_answers is not used.")
     parser.add_argument("--no-warmup", action="store_true", help="Skip the decider warm-up before joining the match.")
     return parser.parse_args()
 
@@ -1346,25 +1375,26 @@ def with_client(client: Any, body) -> Any:
             print(f"[exit] MCP client stop failed: {exc}", file=sys.stderr)
 
 
-def main() -> int:
-    args = parse_args()
+def main(system_prompt: str = SYSTEM_PROMPT, default_name: str = DEFAULT_NAME) -> int:
+    args = parse_args(default_name)
 
-    decider = Decider()
-    try:
-        print(decider.banner(), "\n")
-    except ServerUnavailable as exc:
-        print(f"{exc}\n    -> starting in LLM-fallback mode")
-        decider_down_at_start = True
-    else:
-        decider_down_at_start = False
+    decider: Decider | None = None
+    decider_down_at_start = False
+    if not args.llm_only:  # llm-only never touches the decider server
+        decider = Decider()
+        try:
+            print(decider.banner(), "\n")
+        except ServerUnavailable as exc:
+            print(f"{exc}\n    -> starting in LLM-fallback mode")
+            decider_down_at_start = True
 
     client = MCPClient.load_servers(MCP_SERVERS)[0]
     if decider_down_at_start:
         # Point the decider at nothing useful so the first ask fails open immediately.
         decider.timeout = 1.0
-    stats = with_client(client, lambda: play(client, decider, args))
+    stats = with_client(client, lambda: play(client, decider, args, system_prompt=system_prompt))
 
-    print(f"\n{stats.summary()}; {decider}")
+    print(f"\n{stats.summary()}; {decider if decider is not None else 'decider disabled (llm-only)'}")
     return 0
 
 

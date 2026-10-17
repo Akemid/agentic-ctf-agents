@@ -211,20 +211,23 @@ class ToolCallReviewer(InterventionHandler):
 # --------------------------------------------------------------------------- the agent
 
 
-def parse_args() -> argparse.Namespace:
+DEFAULT_NAME = "refined-strands-decider"
+
+
+def parse_args(default_name: str = DEFAULT_NAME) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Refined AmazingPlayer CTF agent with strands-decider tool review.")
     parser.add_argument("--model", choices=sorted(MODELS.keys()), default="haiku",
                         help="Model to run the agent with (default: haiku).")
     parser.add_argument("--match", default="llm-1", help="Match id to join (default: llm-1).")
-    parser.add_argument("--name", default="refined-strands-decider",
-                        help="Agent name used to join the match (default: refined-strands-decider).")
+    parser.add_argument("--name", default=default_name,
+                        help=f"Agent name used to join the match (default: {default_name}).")
     parser.add_argument("--window", type=int, default=DEFAULT_WINDOW,
                         help=f"Conversation window in messages, 4 per tick (default: {DEFAULT_WINDOW}, ~3 ticks).")
     return parser.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
+def main(system_prompt: str = SYSTEM_PROMPT, default_name: str = DEFAULT_NAME) -> int:
+    args = parse_args(default_name)
 
     decider = Decider()
     try:
@@ -240,7 +243,7 @@ def main() -> int:
     agent = Agent(
         name=args.name,
         model=MODELS[args.model],
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         tools=clients,
         interventions=[gate],
         conversation_manager=make_conversation_manager(args.window),
