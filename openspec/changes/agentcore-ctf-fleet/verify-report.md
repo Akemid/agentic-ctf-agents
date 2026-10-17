@@ -1,3 +1,21 @@
+```yaml
+schema: gentle-ai.verify-result/v1
+evidence_revision: sha256:72d96501e9e4202c0738b588742d77c036e1d07c3330c26baee877041332fa07
+verdict: pass_with_warnings
+blockers: 0
+critical_findings: 0
+requirements: 33/33
+scenarios: 76/76
+test_command: uv run --with pytest pytest -q -p no:cacheprovider
+test_exit_code: 0
+test_output_hash: sha256:329527450c524f753cc757c233e42120d8bbcc9eab86ec98db99d3382c25d970
+build_command: (cd agentcore/cdk && node_modules/.bin/jest) && (cd infra/decider && node_modules/.bin/jest) && uv run --with ruff ruff check .
+build_exit_code: 0
+build_output_hash: sha256:e460b2d3ac59b918ec794e6060e09014ea32e75aa7c1e28a9f5b412da2d060d8
+```
+
+> Envelope note: `evidence_revision` is `sha256(git rev-parse e0dda37^{tree})`, the source tree the suites ran against. Output hashes are sha256 of the captured stdout+stderr of the listed commands.
+
 # Verify Report: agentcore-ctf-fleet
 
 Date: 2026-10-16. Mode: hybrid, Strict TDD. Verdict: **PASS WITH WARNINGS** (0 CRITICAL, 6 WARNING, 3 SUGGESTION).
