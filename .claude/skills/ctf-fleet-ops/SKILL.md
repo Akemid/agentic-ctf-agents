@@ -94,8 +94,9 @@ AgentCore CLI 0.31.1 UPDATES the existing OAuth providers (client id, secret, di
 
 Up:
 
-1. If anything under `infra/decider/adapter/` changed: `cd infra/decider`, redeploy `CtfPersistentStack` first (the CodeBuild source is an S3 asset; the tag is a content hash of the adapter dir plus the model id). Do this only while `DeciderStack` is destroyed.
-2. `cd infra/decider && make build-image YES=1`. It prints `imageTag=<tag>`. The image ends with a strict smoke check (`python -m adapter.smoke --require-checkpoint`), so dependency breakage fails the BUILD, never the endpoint. Skip if the tag already exists in ECR.
+0. Reuse the image when possible. `cd infra/decider && make build && scripts/build_image.sh` (no `--yes`) prints the computed `image tag` without building. Compare with `aws ecr describe-images --repository-name ctf-decider --query 'imageDetails[].imageTags[0]' --output text`. If the tag is present, skip steps 1-2 and deploy it directly (no rebuild, no `CtfPersistentStack` redeploy).
+1. Only if `infra/decider/adapter/` changed (tag missing from ECR): `cd infra/decider`, redeploy `CtfPersistentStack` first (the CodeBuild source is an S3 asset; the tag is a content hash of the adapter dir plus the model id). Do this only while `DeciderStack` is destroyed.
+2. Same condition: `cd infra/decider && make build-image YES=1`. It prints `imageTag=<tag>`. The image ends with a strict smoke check (`python -m adapter.smoke --require-checkpoint`), so dependency breakage fails the BUILD, never the endpoint.
 3. `cd infra/decider && node_modules/.bin/cdk diff DeciderStack -c imageTag=<tag>`. Review IAM changes.
 4. GATE (money). Then:
 
@@ -105,14 +106,21 @@ cd infra/decider && node_modules/.bin/cdk deploy DeciderStack -c imageTag=<tag> 
 
 `IMAGE_TAG=<tag> make deploy-decider` is equivalent (it passes `--require-approval never`); review `IMAGE_TAG=<tag> make diff-decider` first.
 
-Watch CloudWatch log group `/aws/sagemaker/Endpoints/ctf-decider`:
+Startup timeline (measured, 7.5 GB image on `ml.g4dn.xlarge`): `CreateEndpoint` at about t0 + 1 min; container start (`adapter.runtime: starting the decider`) about 3.5-4 min later (SageMaker provisions the GPU and pulls the image); `GET /ping 200` about 30 s after that (model load + warm-up); `InService` right after. Total about 5-6 min from deploy to usable. Tell the user: for the first ~4 min the endpoint shows `Creating` and the container logs are EMPTY. That is normal, not a failure.
 
-- success: `GET /ping 200` (about 4 min);
-- failure: "decider failed again ... staying unhealthy", or a Traceback. Delete at once: `aws cloudformation delete-stack --stack-name DeciderStack`. A `Creating` endpoint CANNOT be deleted until the 600 s startup health-check expires, so a broken container bills up to about 10 min.
+Monitor: poll every 30 s, and stop on the first terminal signal:
+
+- `aws logs filter-log-events` on `/aws/sagemaker/Endpoints/ctf-decider` for `GET /ping HTTP/1.1" 200`, `staying unhealthy` or `Traceback`;
+- plus `aws sagemaker describe-endpoint` status (`InService` or `Failed`).
+
+Outcomes:
+
+- success: `GET /ping 200` then `InService`;
+- failure: ONLY "decider failed again ... staying unhealthy", a Traceback or `Failed`. Delete at once: `aws cloudformation delete-stack --stack-name DeciderStack`. A `Creating` endpoint CANNOT be deleted until the 600 s startup health-check expires, so a broken container bills up to about 10 min.
 
 Validate:
 
-- one real inference through `SageMakerDecider` or `sagemaker-runtime invoke-endpoint` with `infra/decider/adapter/adapter/warmup_body.json`;
+- one real inference (smoke below) or through `SageMakerDecider`;
 - `uv run python spikes/s4_bench.py run --log <decider log> --endpoint ctf-decider --region us-east-2 --n 30 --out <file>`. S4 gate: p95 <= 1000 ms (measured p50 446 ms, p95 646 ms).
 
 Down:
@@ -123,6 +131,33 @@ aws sagemaker list-endpoints --query 'Endpoints[].EndpointName' --output text   
 ```
 
 `make destroy-decider` is equivalent (it passes `--force`) and keeps `/ctf-decider/endpoint-name` on purpose.
+
+### D2. Smoke inference (after `InService`)
+
+```python
+import boto3
+rt = boto3.client("sagemaker-runtime", region_name="us-east-2")
+body = open("infra/decider/adapter/adapter/warmup_body.json", "rb").read()
+r = rt.invoke_endpoint(EndpointName="ctf-decider", ContentType="application/json", Body=body)
+print(r["Body"].read().decode())
+```
+
+Healthy answer: `answers.threat`, `answers.route_bad` and `answers.action` (with `choice` and `probabilities`), plus `adapter.queue_wait_ms`. Latency: the first call from a fresh client takes about 2 s (connection setup); after that about 585 ms round trip from a laptop, about 450 ms on the GPU.
+
+### D3. Did the agents use the decider or the LLM fallback?
+
+Runtime log groups: `/aws/bedrock-agentcore/runtimes/ctfagents_<runtime>-<id>-DEFAULT`.
+
+```bash
+aws logs filter-log-events --log-group-name <group> --start-time <epoch-ms> \
+  --filter-pattern '"playing on the LLM fallback"'
+```
+
+Present: the endpoint was down then and the runtime played on the LLM. Absent while matches ran with the endpoint `InService`: it used the decider. The paginated CLI output can print several counts; use a boto3 paginator or sum them.
+
+Expectation: an agent woken while the endpoint is `InService` uses the decider from the first turn; an agent already in a match picks it up within 300 s (breaker re-probe). A lobby test with the endpoint down correctly logged the fallback line, which confirms the optional decider works in production.
+
+Cost audit: CloudTrail `lookup-events` with `EventName=CreateEndpoint` / `DeleteEndpoint` gives the exact times, so you can compute the billed duration.
 
 ### E. Full teardown
 
@@ -141,7 +176,7 @@ After agents deploy or rotation (verify in AWS, not in CLI output):
 - [ ] Placeholder restored: `agentcore/agentcore.json` contains `discovery-url-not-hydrated`, and `git status` is clean (no `.env.local` secrets, no `aws-targets.json` change)
 
 After decider down: `aws sagemaker list-endpoints` is empty.
-After decider up: `GET /ping 200` in the log, one real inference OK, S4 p95 <= 1000 ms.
+After decider up: `GET /ping 200` in the log, status `InService`, one real inference OK with the expected answer keys (D2), S4 p95 <= 1000 ms.
 
 ## Known Failures
 
@@ -157,6 +192,8 @@ After decider up: `GET /ping 200` in the log, one real inference OK, S4 p95 <= 1
 | `Skipped <provider>` in deploy output | Credentials not hydrated (deployed by hand) | Use `make deploy YES=1` only |
 | `build-image` fails on source hash | Stale S3 asset | Redeploy `CtfPersistentStack`, then rebuild |
 | Decider runtimes log "playing on the LLM fallback" | Endpoint down or not `InService` | Expected when the decider is off; re-probes every 300 s |
+| Endpoint `Creating` and container logs empty for ~4 min | Normal: SageMaker provisions the GPU and pulls the 7.5 GB image | Wait; only "staying unhealthy", a Traceback or `Failed` mean failure (D) |
+| `filter-log-events` CLI prints several counts | Paginated output | Use a boto3 paginator, or sum the counts (D3) |
 | `aws`/`cdk` output empty | rtk hook | `rtk proxy <cmd>` |
 
 ## Lobby Wake Contract (pointer)

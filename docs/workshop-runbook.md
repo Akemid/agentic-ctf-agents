@@ -133,9 +133,18 @@ cd infra/decider
 make build-image YES=1          # CodeBuild builds and pushes; prints imageTag=<hash>
 ```
 
-Redeploy the persistent stack first if you edited `adapter/` (the CodeBuild source is an S3 asset and the build
-refuses a stale upload; do it only while `DeciderStack` is destroyed). Skip this step when the tag from the
-previous workshop is still the right one. A build costs about USD 0.11.
+**Reuse the image when possible.** Check whether the current adapter source already has an image in ECR:
+
+```bash
+cd infra/decider
+make build && scripts/build_image.sh      # no --yes: prints the computed "image tag", builds nothing
+aws ecr describe-images --repository-name ctf-decider --query 'imageDetails[].imageTags[0]' --output text
+```
+
+If the tag is listed, skip this step and deploy it directly in step 4 (no rebuild, no persistent-stack redeploy).
+Only when `adapter/` changed: redeploy the persistent stack first (the CodeBuild source is an S3 asset and the
+build refuses a stale upload; do it only while `DeciderStack` is destroyed), then `make build-image YES=1`.
+A build costs about USD 0.11.
 
 The build ends with a strict smoke check (`python -m adapter.smoke --require-checkpoint`), so a dependency problem
 fails the BUILD and never reaches the endpoint. All dependencies are hash-locked (`requirements.lock`,
@@ -157,9 +166,24 @@ aws sagemaker describe-endpoint --endpoint-name ctf-decider --query EndpointStat
 
 Watch the CloudWatch log group `/aws/sagemaker/Endpoints/ctf-decider`:
 
-- Healthy: `GET /ping 200`. It took about 4 minutes. The status must read `InService` before you continue.
-- Failing: `decider failed again ... staying unhealthy`, or a Traceback. Delete the stack at once:
-  `aws cloudformation delete-stack --stack-name DeciderStack`.
+Measured timeline (7.5 GB image on `ml.g4dn.xlarge`):
+
+| Event | Elapsed |
+|---|---|
+| `cdk deploy` start | t0 |
+| `CreateEndpoint` | about t0 + 1 min |
+| container start (`adapter.runtime: starting the decider`) | about 3.5-4 min after `CreateEndpoint` (SageMaker provisions the GPU and pulls the image) |
+| `GET /ping 200` (model load + warm-up) | about 30 s after container start |
+| `InService` | shortly after `/ping 200` |
+| **Total** | **about 5-6 min** from deploy to usable |
+
+For the first ~4 minutes the endpoint shows `Creating` and the container logs are EMPTY. That is normal. To wait,
+poll every 30 s and stop at the first terminal signal: `filter-log-events` on the log group for
+`GET /ping HTTP/1.1" 200`, `staying unhealthy` or `Traceback`, plus `describe-endpoint` (`InService` or `Failed`).
+
+- Healthy: `GET /ping 200`, then status `InService`. Wait for `InService` before you continue.
+- Failing (ONLY these signals): `decider failed again ... staying unhealthy`, a Traceback, or `Failed`. Delete the
+  stack at once: `aws cloudformation delete-stack --stack-name DeciderStack`.
 
 > **A `Creating` endpoint cannot be deleted.** SageMaker refuses until the start-up health-check timeout (600 s)
 > expires, so a broken container bills for up to about 10 minutes even after you delete the stack. Confirm with
@@ -168,7 +192,19 @@ Watch the CloudWatch log group `/aws/sagemaker/Endpoints/ctf-decider`:
 Validate before the workshop:
 
 - One real inference: invoke `ctf-decider` (`sagemaker-runtime invoke-endpoint`, or the `SageMakerDecider` client)
-  with the body `infra/decider/adapter/adapter/warmup_body.json`.
+  with the body `infra/decider/adapter/adapter/warmup_body.json`:
+
+  ```python
+  import boto3
+  rt = boto3.client("sagemaker-runtime", region_name="us-east-2")
+  body = open("infra/decider/adapter/adapter/warmup_body.json", "rb").read()
+  r = rt.invoke_endpoint(EndpointName="ctf-decider", ContentType="application/json", Body=body)
+  print(r["Body"].read().decode())
+  ```
+
+  A healthy answer has `answers.threat`, `answers.route_bad` and `answers.action` (with `choice` and
+  `probabilities`), plus `adapter.queue_wait_ms`. The first call from a fresh client takes about 2 s (connection
+  setup); after that about 585 ms round trip from a laptop, about 450 ms on the GPU.
 - Latency gate S4 (p95 <= 1000 ms; measured p50 446 ms, p95 646 ms):
 
   ```bash
@@ -310,6 +346,19 @@ agentcore logs
 aws sagemaker describe-endpoint --endpoint-name ctf-decider --query EndpointStatus --output text
 ```
 
+**Decider or LLM fallback?** The runtime log groups are `/aws/bedrock-agentcore/runtimes/ctfagents_<runtime>-<id>-DEFAULT`:
+
+```bash
+aws logs filter-log-events --log-group-name <group> --start-time <epoch-ms> \
+  --filter-pattern '"playing on the LLM fallback"'
+```
+
+A match means the endpoint was down then and the runtime played on the LLM. No match while matches ran with the
+endpoint `InService` means it used the decider. The paginated CLI output can print several counts: use a boto3
+paginator, or sum them. An agent woken while the endpoint is `InService` uses the decider from the first turn; one
+already in a match picks it up within 300 s (breaker re-probe). For a cost audit, CloudTrail `lookup-events` with
+`EventName=CreateEndpoint` / `DeleteEndpoint` gives the exact times, hence the billed duration.
+
 `status` reports `running`, `finished`, `failed`, with the tick count, and stores the last status and the time
 it was last seen in `.fleet/<match-id>.json`. It does NOT query a session that was stopped, whose start failed,
 whose last status is `finished`/`failed`/`stopped`, or that is older than the 4 hour max lifetime: it prints
@@ -379,6 +428,7 @@ USD 25/month while up, idle runtimes about nothing.
 | `cdk deploy` of the decider refuses to run | no `imageTag` context (intentional guard) | pass the tag printed by `make build-image` |
 | A raw `cdk deploy` hangs with no output | the IAM approval prompt in a non-interactive shell | Ctrl-C; use `make deploy-decider` / `make deploy-persistent` (they pass `--require-approval never`) after the matching `make diff-*` |
 | the endpoint never turns healthy (`No module named 'torch.distributed.checkpoint.hf_storage'`) | unpinned dependencies (fixed by the hash lock and the build-time smoke check) | rebuild the image; never unpin. See `decider-image-deps.md` |
+| the endpoint is `Creating` and the container logs are empty for about 4 minutes | normal: SageMaker provisions the GPU and pulls the 7.5 GB image | wait; only `staying unhealthy`, a Traceback or `Failed` mean failure (step 4) |
 | the endpoint still bills after you deleted a broken stack | a `Creating` endpoint cannot be deleted until the 600 s start-up check expires | wait about 10 minutes, then confirm `list-endpoints` is empty |
 | runtimes run old code or staging | stale gitignored `agentcore/.cache` | `rm -rf agentcore/.cache`, redeploy |
 | hydrate names an agent, or the game has no agent clients | the game stack was deployed without all four `agentClientNames` | redeploy the game with `-c agentClientNames=harness,harness-sdk,strand-decider,decider-loop`, then rotate (step 5) |
