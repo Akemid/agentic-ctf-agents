@@ -134,7 +134,7 @@ and the CodeBuild role has no pull grant on any other repository. `Dockerfile.lo
   resolved at build time. `strands-decider==0.1.0` only asks for `torch>=2.7` and `transformers>=5.15,<6`; the first
   image left everything else open, pip took the newest transformers, and its model code imports
   `torch.distributed.checkpoint.hf_storage`, which torch 2.7.1 does not ship (it first appears in 2.8). The endpoint
-  never became healthy. Details: `openspec/changes/agentcore-ctf-fleet/decider-image-deps.md`.
+  never became healthy. Details: `openspec/changes/archive/2026-10-16-agentcore-ctf-fleet/decider-image-deps.md`.
 - torch: `torch==2.14.1+cu126` from the CUDA 12.6 wheel index (`https://download.pytorch.org/whl/cu126`), installed
   first and alone (`--no-deps --require-hashes -r torch.lock`; `torch.lock` is the torch entry of `requirements.lock`,
   verbatim, and a test keeps them equal, because pip skips torch's entry in the main install and would never verify its
