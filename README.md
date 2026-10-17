@@ -2,6 +2,8 @@
 
 This project was created with the [AgentCore CLI](https://github.com/aws/agentcore-cli).
 
+**Operating the fleet** (deploy, decider up/down, workshop setup and teardown, credential rotation, costs): see [docs/workshop-runbook.md](docs/workshop-runbook.md) and the Claude Code skill [`.claude/skills/ctf-fleet-ops/SKILL.md`](.claude/skills/ctf-fleet-ops/SKILL.md).
+
 ## Project Structure
 
 ```
