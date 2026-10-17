@@ -50,7 +50,8 @@ CTF_BUDGET_EMAIL=<your-email> make deploy-persistent
 # whenever the adapter or the model changes (MUTATING: runs CodeBuild, pushes to ECR)
 make build-image YES=1                               # prints imageTag=<hash>
 # weekly: creates the GPU endpoint (BILLING); wait for InService (start-up timeout is 600 s)
-IMAGE_TAG=<hash> make deploy-decider
+IMAGE_TAG=<hash> make diff-decider     # read-only: review IAM and resource changes
+IMAGE_TAG=<hash> make deploy-decider   # passes --require-approval never; get the OK first (billing)
 # teardown: stops billing; ECR, the Budget and the endpoint-name parameter stay. Needs no tag and no email
 make destroy-decider
 ```

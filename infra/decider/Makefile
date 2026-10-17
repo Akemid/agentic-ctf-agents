@@ -1,9 +1,10 @@
 # Local, non-mutating targets first; the deploy/destroy/build-image targets mutate AWS.
-# Every deploy/destroy target runs the CDK CLI, which prompts before anything destructive.
+# Deploy targets run with --require-approval never so they work in non-interactive shells (the CDK IAM
+# prompt would otherwise hang). Review IAM changes first with the matching diff-* target.
 CDK := node_modules/.bin/cdk
 
 .PHONY: install build test test-adapter synth smoke-local build-image \
-	deploy-persistent deploy-decider destroy-decider
+	diff-persistent diff-decider deploy-persistent deploy-decider destroy-decider
 
 install:
 	npm ci
@@ -33,17 +34,27 @@ build-image:
 #   CTF_BUDGET_EMAIL=<address> make deploy-persistent
 deploy-persistent: build
 	$(if $(CTF_BUDGET_EMAIL),,$(error set CTF_BUDGET_EMAIL to the budget alert recipient))
-	$(CDK) deploy CtfPersistentStack
+	$(CDK) deploy CtfPersistentStack --require-approval never
 
-# MUTATING and BILLING: creates the GPU endpoint. The tag is what `make build-image` printed.
+# Read-only: show what a deploy would change (review IAM statements before deploying).
+diff-persistent: build
+	$(if $(CTF_BUDGET_EMAIL),,$(error set CTF_BUDGET_EMAIL to the budget alert recipient))
+	$(CDK) diff CtfPersistentStack
+
+diff-decider: build
+	$(if $(IMAGE_TAG),,$(error set IMAGE_TAG to the tag printed by build-image))
+	$(CDK) diff DeciderStack -c imageTag=$(IMAGE_TAG)
+
+# MUTATING and BILLING: creates the GPU endpoint (about $0.74/h). The tag is what `make build-image`
+# printed. Get the user's OK first and review `make diff-decider`.
 #   IMAGE_TAG=<hash> make deploy-decider
 # Without -c imageTag the stack carries an error annotation, so `cdk deploy` refuses to run.
 deploy-decider: build
 	$(if $(IMAGE_TAG),,$(error set IMAGE_TAG to the tag printed by build-image))
-	$(CDK) deploy DeciderStack -c imageTag=$(IMAGE_TAG)
+	$(CDK) deploy DeciderStack -c imageTag=$(IMAGE_TAG) --require-approval never
 
 # MUTATING: stops the endpoint billing. Needs no tag and no email: `cdk destroy` does not validate the
 # stack's error annotations. ECR, the Budget and the /ctf-decider/endpoint-name parameter
 # (CtfPersistentStack) stay, so the decider runtimes keep starting and fall back to the LLM.
 destroy-decider: build
-	$(CDK) destroy DeciderStack
+	$(CDK) destroy DeciderStack --force
