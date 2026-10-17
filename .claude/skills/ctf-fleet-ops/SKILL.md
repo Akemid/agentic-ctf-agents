@@ -198,7 +198,7 @@ After decider up: `GET /ping 200` in the log, status `InService`, one real infer
 
 ## Lobby Wake Contract (pointer)
 
-Start payload takes `slot` or `agent_index` (0..2) with an explicit `team`. A synchronous `start` returns `started`, or `rejected` with `join_match failed: <reason>`. The game server needs `InvokeAgentRuntime` and `InvokeAgentRuntimeForUser`. Details: `openspec/changes/agentcore-ctf-fleet/lobby-wake.md`.
+Start payload takes `slot` or `agent_index` (0..2) with an explicit `team`. A synchronous `start` returns `started`, or `rejected` with `join_match failed: <reason>`. The game server needs `InvokeAgentRuntime` and `InvokeAgentRuntimeForUser`. Details: `openspec/changes/archive/2026-10-16-agentcore-ctf-fleet/lobby-wake.md`.
 
 ## Costs (us-east-2)
 
@@ -218,5 +218,5 @@ After any procedure report: what ran, what was verified (checklist items with ev
 
 - `docs/workshop-runbook.md` (human runbook), `infra/decider/README.md`, `infra/decider/Makefile`, `Makefile`
 - `scripts/deploy_fleet.sh`, `scripts/hydrate_credentials.py`, `scripts/fleet.py`, `infra/decider/scripts/build_image.sh`
-- `openspec/changes/agentcore-ctf-fleet/`: `decider-image-deps.md`, `decider-optional.md`, `lobby-wake.md`, `contract-v2.md`
+- `openspec/changes/archive/2026-10-16-agentcore-ctf-fleet/`: `decider-image-deps.md`, `decider-optional.md`, `lobby-wake.md`, `contract-v2.md`
 - `AGENTS.md`

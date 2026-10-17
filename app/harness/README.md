@@ -19,7 +19,7 @@ One CTF character played by a `strands_harness` agent. Ported from `local/agent/
 `start` answers after `join_match` (up to 30 s): `started` carries the `team` and `agent_index` the server assigned (also as `slot`, the lobby's key, same value), a refused
 seat is `rejected` with `join_match failed: <reason>`, and the match then runs in the background. An optional `agent_index` (0..2, like `join_match`; `slot` is an equivalent key and the web lobby sends it)
 needs an explicit `team` and is never traded for another one. `status` and `stop` must use the same AgentCore session id
-as `start`. Caller-supplied message history is rejected. See `openspec/changes/agentcore-ctf-fleet/lobby-wake.md`.
+as `start`. Caller-supplied message history is rejected. See `openspec/changes/archive/2026-10-16-agentcore-ctf-fleet/lobby-wake.md`.
 
 `stop` takes effect at the next tick (or after the in-flight tool call returns, bounded by the
 `wait_for_turn` long-poll of about 25 s), so `status` can report `stopping` for up to that long.
