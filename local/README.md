@@ -38,3 +38,16 @@ uv add strands-decider
 ```bash
 uv run strands-decider serve StrandsAgents/strands-decider-2B-hobson-v21 --port 8099
 ```
+
+## Agents
+
+The agents live in `agent/refined/` (see `agent/refined/README.md`). All system prompts are defined in
+`agent/refined/prompts.py`. Each agent takes `--prompt {refined,direct}` (default `refined`); `direct` swaps in
+the short A/B prompt and a `refined-direct-*` default name.
+
+```bash
+uv run python agent/refined/harness_sdk.py --match llm-1
+uv run python agent/refined/harness_sdk.py --match llm-1 --prompt direct
+```
+
+`run_agents.sh`, `run_agents_sdk.sh` and `run_agents_decider.sh` launch a 3-agent team with the refined agents.

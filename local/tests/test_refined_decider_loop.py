@@ -422,13 +422,5 @@ class JoinMapTests(unittest.TestCase):
         self.assertIsNone(dl.fetch_map(client))
 
 
-class LegacyDeciderLoopScriptTests(unittest.TestCase):
-    """The original `agent/agent-decider-loop.py` script: same v2 fix."""
-
-    def test_the_script_does_not_mention_the_removed_route_field(self):
-        text = (AGENT_DIR / "agent-decider-loop.py").read_text()
-        self.assertNotIn("min_enemy_distance", text)
-
-
 if __name__ == "__main__":
     unittest.main()

@@ -1,12 +1,11 @@
 """REFINED CTF agent (plain Strands SDK + MCP) whose tool calls are reviewed by a local strands-decider.
 
-Refined version of `agent/agent-strand-decider.py` (the original is untouched). Same agent as
-`harness_sdk.py` -- model, prompt, MCP tools, bounded history (`--window`) and act-fast prompt
-(all imported from it) -- plus an `InterventionHandler`. Change versus the
-original review: only `tag` and `grab_flag` are gated by the decider; `move` and `wait` proceed
-immediately, so no decider round trip is paid on every move.
+Same agent as `harness_sdk.py` -- model, prompt, MCP tools, bounded history (`--window`) and
+act-fast prompt (all imported from it) -- plus an `InterventionHandler`. Only `tag` and `grab_flag`
+are gated by the decider; `move` and `wait` proceed immediately, so no decider round trip is paid
+on every move.
 
-The original description follows. An `InterventionHandler` runs before the gated game actions. A local strands-decider
+An `InterventionHandler` runs before the gated game actions. A local strands-decider
 model answers narrow yes/no questions about the proposed call, and a plain-Python policy
 turns those probabilities into `Guide` (send the model back with feedback) or `Proceed`.
 
@@ -35,10 +34,12 @@ from _client import NAME, Decider, ServerUnavailable  # noqa: E402
 from harness_sdk import (  # noqa: E402
     DEFAULT_WINDOW,
     MODELS,
+    PROMPT_CHOICES,
     SYSTEM_PROMPT,
     build_instruction,
     make_conversation_manager,
 )
+from prompts import DIRECT_SYSTEM_PROMPT  # noqa: E402
 from strands import Agent  # noqa: E402
 from strands.interventions import Guide, InterventionHandler, Proceed  # noqa: E402
 from strands.tools.mcp import MCPClient  # noqa: E402
@@ -212,22 +213,28 @@ class ToolCallReviewer(InterventionHandler):
 
 
 DEFAULT_NAME = "refined-strands-decider"
+DIRECT_NAME = "refined-direct-strands-decider"
 
 
-def parse_args(default_name: str = DEFAULT_NAME) -> argparse.Namespace:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Refined AmazingPlayer CTF agent with strands-decider tool review.")
     parser.add_argument("--model", choices=sorted(MODELS.keys()), default="haiku",
                         help="Model to run the agent with (default: haiku).")
     parser.add_argument("--match", default="llm-1", help="Match id to join (default: llm-1).")
-    parser.add_argument("--name", default=default_name,
-                        help=f"Agent name used to join the match (default: {default_name}).")
+    parser.add_argument("--name", default=None,
+                        help=f"Agent name used to join the match (default: {DEFAULT_NAME}; {DIRECT_NAME} with --prompt direct).")
+    parser.add_argument("--prompt", choices=PROMPT_CHOICES, default="refined",
+                        help="System prompt: the refined act-fast prompt or the short direct A/B prompt (default: refined).")
     parser.add_argument("--window", type=int, default=DEFAULT_WINDOW,
                         help=f"Conversation window in messages, 4 per tick (default: {DEFAULT_WINDOW}, ~3 ticks).")
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.name = args.name or (DIRECT_NAME if args.prompt == "direct" else DEFAULT_NAME)
+    return args
 
 
-def main(system_prompt: str = SYSTEM_PROMPT, default_name: str = DEFAULT_NAME) -> int:
-    args = parse_args(default_name)
+def main() -> int:
+    args = parse_args()
+    system_prompt = DIRECT_SYSTEM_PROMPT if args.prompt == "direct" else SYSTEM_PROMPT
 
     decider = Decider()
     try:

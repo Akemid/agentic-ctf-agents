@@ -30,7 +30,7 @@ for i in 1 2 3; do
   name="${NAME_PREFIX}-${i}"
   echo "Starting agent '$name'"
   STRANDS_DECIDER_URL="$DECIDER_URL" \
-    uv run agent/agent-strand-decider.py --model "$MODEL" --match "$MATCH" --name "$name" &
+    uv run agent/refined/strand_decider.py --model "$MODEL" --match "$MATCH" --name "$name" &
   pids+=("$!")
 done
 
