@@ -12,3 +12,17 @@ spikes/**/answers-*.json
 .venv/
 .env.local
 .fleet/
+.ruff_cache/
+
+# Secrets and env files (keep examples tracked)
+.env
+.env.*
+!.env.example
+
+# Local agent tooling
+.agent/
+.claude/settings.local.json
+
+# Build output
+node_modules/
+cdk.out/
