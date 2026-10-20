@@ -26,3 +26,7 @@ spikes/**/answers-*.json
 # Build output
 node_modules/
 cdk.out/
+
+# Personal process artifacts (kept locally, not published)
+.claude/
+openspec/

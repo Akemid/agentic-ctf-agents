@@ -4,9 +4,6 @@ How to stand up the CTF agent fleet for a workshop and tear it down again. Four 
 (`harness`, `harness_sdk`, `strand_decider`, `decider_loop`) play against the agentic-ctf MCP server. The two
 decider runtimes call a SageMaker endpoint (`ctf-decider`) that bills by the hour while it exists.
 
-> Claude Code users: the skill `.claude/skills/ctf-fleet-ops/SKILL.md` encodes this runbook as an agent
-> procedure with confirmation gates. This file is the human version; keep both in sync.
-
 > **Cost warning.** The game stack bills 24/7 (ALB plus Fargate, about USD 25 per month), so destroy it between
 > workshops too (step 10). The GPU endpoint (`ml.g4dn.xlarge`, 1 instance) costs about USD 0.74 per hour, roughly
 > **USD 537 per month if it is forgotten**. Destroy it (step 10) the moment the workshop ends. A SageMaker
@@ -148,7 +145,7 @@ A build costs about USD 0.11.
 
 The build ends with a strict smoke check (`python -m adapter.smoke --require-checkpoint`), so a dependency problem
 fails the BUILD and never reaches the endpoint. All dependencies are hash-locked (`requirements.lock`,
-`torch.lock`, torch 2.14.1+cu126): do not unpin them. Background: `openspec/changes/archive/2026-10-16-agentcore-ctf-fleet/decider-image-deps.md`.
+`torch.lock`, torch 2.14.1+cu126): do not unpin them. Background: `docs/decider-image-deps.md`.
 
 ## 4. DeciderStack (OPTIONAL, starts billing)
 
@@ -336,7 +333,7 @@ before it answers, so `started` means the character is seated in that exact seat
 agent_index are what the server assigned. A refused seat is a failed start (exit 1) with the reason, for example
 `join_match failed: slot_taken`; the runtime never falls back to another seat. After a refusal the runner is restartable at once (an immediate retry on another seat works). A start can therefore take up
 to 15 s to answer (30 s for `harness`, whose model has to call `join_match` itself). See
-`openspec/changes/archive/2026-10-16-agentcore-ctf-fleet/lobby-wake.md`.
+`docs/lobby-wake.md`.
 
 ## 8. Play and monitor
 

@@ -64,7 +64,6 @@ and is vendored into each runtime by `scripts/sync_common.py`.
 | `spikes/` | Exploratory experiments and their findings (`spikes/FINDINGS.md`). |
 | `tests/` | Python test suite. |
 | `docs/` | Runbooks and acceptance notes. |
-| `openspec/` | Spec-driven development artifacts. |
 
 ## Prerequisites
 
