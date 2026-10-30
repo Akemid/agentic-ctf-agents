@@ -1,6 +1,6 @@
 """REFINED minimal CTF agent built with the plain Strands SDK (no strands_harness).
 
-Refined version of `agent/agent-harness-sdk.py` (the original is untouched). The agent owns its
+The agent owns its
 loop, so every tick costs a full LLM turn over the whole conversation. Changes to keep that cheap:
 
 - Bounded history: `SlidingWindowConversationManager` keeps roughly the last 3 ticks and pins the
@@ -16,7 +16,13 @@ loop, so every tick costs a full LLM turn over the whole conversation. Changes t
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from prompts import ACT_FAST_PROMPT, DIRECT_SYSTEM_PROMPT  # noqa: E402, F401
+from prompts import SDK_SYSTEM_PROMPT as SYSTEM_PROMPT  # noqa: E402
 from strands import Agent
 from strands.agent.conversation_manager import SlidingWindowConversationManager
 from strands.tools.mcp import MCPClient
@@ -26,34 +32,6 @@ MODELS = {
     "opus": "global.anthropic.claude-opus-4-6-v1",
     "nova-lite": "global.amazon.nova-2-lite-v1:0",
 }
-
-ACT_FAST_PROMPT = (
-    "Each tick: call wait_for_turn, then immediately call exactly one action tool with that tick. "
-    "Do not write any text between tool calls. Do not call get_rules again after joining."
-)
-
-SYSTEM_PROMPT = (
-    "You are AmazingPlayer, a Capture the Flag game agent competing as a member of a "
-    "team. You are direct and tactical—make quick strategic decisions to advance "
-    "your team's objectives. Use the MCP connection to interact with the game state, "
-    "communicate team positions, coordinate flag captures, and respond to enemy movements "
-    "with speed and precision. Analyze game state efficiently and prioritize actions that "
-    "give your team the best advantage."
-    " Each wait_for_turn result includes state.routes: route options computed by the "
-    "server (ids like enemy_flag_direct, enemy_flag_safe, enemy_flag_detour, own_base_*, "
-    "tag:<enemy_id>, defend_flag). The server never recommends one; you choose. Weigh each "
-    "route's length, blocked_now/blocked_reason, risks (cells where you can be tagged) and "
-    "closest_threat (the nearest enemy that can tag you along that route, as enemy_id, step and "
-    "distance in moves around walls, or null when there is none), then call move with that "
-    "route's first_step. A tag route with "
-    "length 0 means the enemy is adjacent: call tag with that enemy_id. Call grab_flag when "
-    "standing on the enemy flag. Call exactly one action per tick, with the current tick."
-    " The board never changes, so turns do not repeat it: join_match returns it once as `map` "
-    "(grid, walls, fields, flag_bases) and get_map returns it again at any time. If you lose "
-    "track of the layout, call get_map. Each turn also carries last_action, the outcome of your "
-    "previous action (null on your first turn); use it to notice a blocked or rejected move."
-    " " + ACT_FAST_PROMPT
-)
 
 MCP_SERVERS = {
     "ctf-game": {
@@ -85,23 +63,30 @@ def build_instruction(match: str, name: str) -> str:
             "and play by calling wait_for_turn and one action each tick until you receive match_over.")
 
 
+PROMPT_CHOICES = ("refined", "direct")
 DEFAULT_NAME = "refined-sdk"
+DIRECT_NAME = "refined-direct-sdk"
 
 
-def parse_args(default_name: str = DEFAULT_NAME) -> argparse.Namespace:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Refined AmazingPlayer CTF agent (plain Strands SDK).")
     parser.add_argument("--model", choices=sorted(MODELS.keys()), default="haiku",
                         help="Model to run the agent with (default: haiku).")
     parser.add_argument("--match", default="llm-1", help="Match id to join (default: llm-1).")
-    parser.add_argument("--name", default=default_name,
-                        help=f"Agent name used to join the match (default: {default_name}).")
+    parser.add_argument("--name", default=None,
+                        help=f"Agent name used to join the match (default: {DEFAULT_NAME}; {DIRECT_NAME} with --prompt direct).")
+    parser.add_argument("--prompt", choices=PROMPT_CHOICES, default="refined",
+                        help="System prompt: the refined act-fast prompt or the short direct A/B prompt (default: refined).")
     parser.add_argument("--window", type=int, default=DEFAULT_WINDOW,
                         help=f"Conversation window in messages, 4 per tick (default: {DEFAULT_WINDOW}, ~3 ticks).")
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.name = args.name or (DIRECT_NAME if args.prompt == "direct" else DEFAULT_NAME)
+    return args
 
 
-def main(system_prompt: str = SYSTEM_PROMPT, default_name: str = DEFAULT_NAME) -> None:
-    args = parse_args(default_name)
+def main() -> None:
+    args = parse_args()
+    system_prompt = DIRECT_SYSTEM_PROMPT if args.prompt == "direct" else SYSTEM_PROMPT
     clients = MCPClient.load_servers(MCP_SERVERS, prefix_with_server_name=True)
 
     agent = Agent(

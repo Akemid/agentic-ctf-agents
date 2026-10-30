@@ -86,19 +86,6 @@ class ConversationManagerTests(unittest.TestCase):
         self.assertTrue(all(a != b for a, b in zip(roles, roles[1:])), roles)
 
 
-class LegacyAgentPromptTests(unittest.TestCase):
-    """The original `agent/agent-*.py` scripts carry their own copy of the prompt: same v2 fix."""
-
-    def test_no_script_mentions_the_removed_route_field(self):
-        for name in ("agent-harness.py", "agent-harness-sdk.py", "agent-strand-decider.py"):
-            text = (AGENT_DIR / name).read_text()
-            self.assertNotIn("min_enemy_distance", text, name)
-        for name in ("agent-harness.py", "agent-harness-sdk.py", "agent-strand-decider.py"):
-            text = (AGENT_DIR / name).read_text()
-            self.assertIn("closest_threat", text, name)
-            self.assertIn("get_map", text, name)
-
-
 class PromptAndCliTests(unittest.TestCase):
     def test_act_fast_prompt_in_all_three(self):
         for module in (sdk, sd, hn):

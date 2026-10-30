@@ -1,4 +1,4 @@
-"""Tests for the pure logic in agent/agent-decider-loop.py.
+"""Tests for the pure logic in agent/refined/decider_loop.py (ported from the removed original script's suite).
 
 Written with unittest-style classes so they run under both pytest and
 `python -m unittest` (pytest is not installed in this project's venv).
@@ -15,11 +15,14 @@ import unittest
 from pathlib import Path
 
 AGENT_DIR = Path(__file__).resolve().parent.parent / "agent"
-sys.path.insert(0, str(AGENT_DIR))
+REFINED_DIR = AGENT_DIR / "refined"
+for _path in (REFINED_DIR, AGENT_DIR):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 
-_spec = importlib.util.spec_from_file_location("agent_decider_loop", AGENT_DIR / "agent-decider-loop.py")
+_spec = importlib.util.spec_from_file_location("refined_decider_loop_logic", REFINED_DIR / "decider_loop.py")
 loop = importlib.util.module_from_spec(_spec)
-sys.modules["agent_decider_loop"] = loop  # dataclasses resolves string annotations via sys.modules
+sys.modules["refined_decider_loop_logic"] = loop  # dataclasses resolves string annotations via sys.modules
 _spec.loader.exec_module(loop)
 
 

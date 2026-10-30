@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Launch the full 3-agent team using the plain-SDK agent (agent-harness-sdk.py),
+# Launch the full 3-agent team using the plain-SDK agent (agent/refined/harness_sdk.py),
 # all running the SAME model.
 #
 # Change the model by editing the MODEL variable below, or override it inline:
@@ -34,7 +34,7 @@ echo "Launching team of 3 agents (plain SDK) with model '$MODEL' (match: $MATCH)
 for i in 1 2 3; do
   name="${NAME_PREFIX}-${i}"
   echo "Starting agent '$name'"
-  uv run agent/agent-harness-sdk.py --model "$MODEL" --match "$MATCH" --name "$name" &
+  uv run agent/refined/harness_sdk.py --model "$MODEL" --match "$MATCH" --name "$name" &
   pids+=("$!")
 done
 

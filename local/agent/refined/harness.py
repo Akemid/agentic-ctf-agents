@@ -1,8 +1,8 @@
 """REFINED CTF agent on `strands_harness.create_harness`.
 
-Refined version of `agent/agent-harness.py` (the original is untouched). The only behavioral
-change is the act-fast prompt appended to the system prompt (shared with `harness_sdk.py`);
-`programmatic_tool_caller` stays enabled. Default `--name` is `refined-harness` and the initial
+The only behavioral
+feature on top of the plain harness is the act-fast prompt appended to the system prompt
+(shared with `harness_sdk.py`); `programmatic_tool_caller` stays enabled. Default `--name` is `refined-harness` and the initial
 instruction is in English.
 
 Not changed: `create_harness` has its own `context_manager` (default on) which takes precedence
@@ -15,7 +15,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from harness_sdk import SYSTEM_PROMPT, build_instruction  # noqa: E402
+from harness_sdk import PROMPT_CHOICES, SYSTEM_PROMPT, build_instruction  # noqa: E402
+from prompts import DIRECT_SYSTEM_PROMPT  # noqa: E402
 from strands_harness import create_harness  # noqa: E402
 
 # Model alias (CLI) -> Bedrock model id.
@@ -26,9 +27,10 @@ MODELS = {
 }
 
 DEFAULT_NAME = "refined-harness"
+DIRECT_NAME = "refined-direct-harness"
 
 
-def parse_args(default_name: str = DEFAULT_NAME) -> argparse.Namespace:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Refined AmazingPlayer CTF agent (strands_harness)."
     )
@@ -45,14 +47,23 @@ def parse_args(default_name: str = DEFAULT_NAME) -> argparse.Namespace:
     )
     parser.add_argument(
         "--name",
-        default=default_name,
-        help=f"Agent name used to join the match (default: {default_name}).",
+        default=None,
+        help=f"Agent name used to join the match (default: {DEFAULT_NAME}; {DIRECT_NAME} with --prompt direct).",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--prompt",
+        choices=PROMPT_CHOICES,
+        default="refined",
+        help="System prompt: the refined act-fast prompt or the short direct A/B prompt (default: refined).",
+    )
+    args = parser.parse_args()
+    args.name = args.name or (DIRECT_NAME if args.prompt == "direct" else DEFAULT_NAME)
+    return args
 
 
-def main(system_prompt: str = SYSTEM_PROMPT, default_name: str = DEFAULT_NAME) -> None:
-    args = parse_args(default_name)
+def main() -> None:
+    args = parse_args()
+    system_prompt = DIRECT_SYSTEM_PROMPT if args.prompt == "direct" else SYSTEM_PROMPT
     model_id = MODELS[args.model]
 
     agent = create_harness(

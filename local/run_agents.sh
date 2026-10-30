@@ -33,7 +33,7 @@ echo "Launching team of 3 agents with model '$MODEL' (match: $MATCH)"
 for i in 1 2 3; do
   name="${NAME_PREFIX}-${i}"
   echo "Starting agent '$name'"
-  uv run agent/agent-harness.py --model "$MODEL" --match "$MATCH" --name "$name" &
+  uv run agent/refined/harness.py --model "$MODEL" --match "$MATCH" --name "$name" &
   pids+=("$!")
 done
 

@@ -60,5 +60,5 @@ aws sagemaker list-endpoints --query 'Endpoints[].EndpointName' --output text
 
 ## Record the result
 
-Write the outcome (date, token validity found, first-tick latency, any fallback or 401) in
-`openspec/changes/archive/2026-10-16-agentcore-ctf-fleet/apply-progress.md` and mark task 4.6 done only when criteria 1 to 7 hold.
+Write down the outcome (date, token validity found, first-tick latency, any fallback or 401). The run passes
+only when criteria 1 to 7 hold.

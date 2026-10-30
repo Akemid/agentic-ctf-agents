@@ -1,8 +1,7 @@
 """REFINED CTF agent: plain Python owns the game loop and a local strands-decider picks the action.
 
-This is the refined version of `agent/agent-decider-loop.py` (the original is untouched).
 Everything is kept (warm-up, time budget, LLM timeout + TickCancelHandler, StopAfterActionHook,
-plan memory by path, error handling, exit safety net, flags). Changes versus the original:
+plan memory by path, error handling, exit safety net, flags). Notable behavior:
 
 1. ONE decider request now carries THREE questions about the same encoded state (cheap, see
    `_client.Decider`): `threat` (noul), `route_bad` (noul) and `action` (choice over the server
@@ -80,8 +79,11 @@ from typing import Any, Literal
 
 # `_client` lives in the parent `agent/` folder.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from _client import Decider, ServerUnavailable  # noqa: E402
+from prompts import DECIDER_INSTRUCTIONS, DIRECT_SYSTEM_PROMPT, LLM_PLAN_NOTE  # noqa: E402
+from prompts import DECIDER_LOOP_SYSTEM_PROMPT as SYSTEM_PROMPT  # noqa: E402
 from strands import Agent
 from strands.hooks import AfterToolCallEvent, AfterToolsEvent
 from strands.interventions import Deny, InterventionHandler, Proceed
@@ -96,13 +98,6 @@ MODELS = {
     "opus": "global.anthropic.claude-opus-4-6-v1",
     "nova-lite": "global.amazon.nova-2-lite-v1:0",
 }
-
-SYSTEM_PROMPT = (
-    "You are AmazingPlayer, a Capture the Flag game agent competing as a member of a "
-    "team. You are direct and tactical. You are given the current game state for ONE tick. "
-    "Pick the single best action and call exactly one action tool with the tick number "
-    "provided. Do not call any other tool and do not answer with text only."
-)
 
 MCP_SERVER_NAME = "ctf-game"
 MCP_SERVERS = {
@@ -130,24 +125,6 @@ DEFAULT_SAFETY_MARGIN_MS = 300
 EXIT_GRACE_S = 2.0
 
 DECIDER_LOCK_FILE = os.path.join(tempfile.gettempdir(), "strands-decider.lock")
-
-DECIDER_INSTRUCTIONS = (
-    "You are a player in a Capture the Flag game. Choose the single best action for this "
-    "tick. Reach the enemy flag, grab it, and carry it back to your own base. The options "
-    "are routes offered by the server: choose between them by weighing length, whether "
-    "they are blocked right now, and the risk of being tagged along the way. Tag enemies "
-    "inside your own field when it helps, and defend your flag when it is threatened. "
-    "Your current plan, if any, is shown, and routes that continue your current path are "
-    "marked; route ids are recomputed every tick and do not mean the same path from one tick "
-    "to the next. Keep or change the plan based on the current situation."
-)
-
-LLM_PLAN_NOTE = (
-    "Your current plan, if any, is shown, and routes that continue your current path are "
-    "marked; route ids are recomputed every tick and do not mean the same path from one tick "
-    "to the next. Keep or change the plan based on the current situation. When you call move or tag "
-    "for a route, set `rationale` to `route <route_id>` (e.g. `route enemy_flag_direct`)."
-)
 
 # ---------------------------------------------------------------------------
 # Pure logic (no I/O): state -> options, label -> tool call, answer parsing
@@ -1284,15 +1261,19 @@ def play(client: MCPClient, decider: Decider | None, args: argparse.Namespace,
 
 
 DEFAULT_NAME = "refined-decider"
+DIRECT_NAME = "refined-direct-decider"
+PROMPT_CHOICES = ("refined", "direct")
 
 
-def parse_args(default_name: str = DEFAULT_NAME) -> argparse.Namespace:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Refined AmazingPlayer CTF agent with a code-owned loop and strands-decider.")
     parser.add_argument("--model", choices=sorted(MODELS.keys()), default="haiku",
                         help="Model used for the LLM fallback (default: haiku).")
     parser.add_argument("--match", default="llm-1", help="Match id to join (default: llm-1).")
-    parser.add_argument("--name", default=default_name,
-                        help=f"Agent name used to join the match (default: {default_name}; lowercased to fit [a-z0-9_-]).")
+    parser.add_argument("--name", default=None,
+                        help=f"Agent name used to join the match (default: {DEFAULT_NAME}; {DIRECT_NAME} with --prompt direct; lowercased to fit [a-z0-9_-]).")
+    parser.add_argument("--prompt", choices=PROMPT_CHOICES, default="refined",
+                        help="System prompt for the LLM fallback: the refined prompt or the short direct A/B prompt (default: refined).")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
                         help=f"Minimum decider confidence to act without the LLM (default: {DEFAULT_THRESHOLD}).")
     parser.add_argument("--threat-threshold", type=float, default=THREAT_YES,
@@ -1308,7 +1289,9 @@ def parse_args(default_name: str = DEFAULT_NAME) -> argparse.Namespace:
                              "consulted (no server needed). The LLM always runs with the time left, no budget "
                              "skip; on timeout the tick is a wait. combine_answers is not used.")
     parser.add_argument("--no-warmup", action="store_true", help="Skip the decider warm-up before joining the match.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.name = args.name or (DIRECT_NAME if args.prompt == "direct" else DEFAULT_NAME)
+    return args
 
 
 def lingering_threads(threads: Any) -> list[Any]:
@@ -1375,8 +1358,9 @@ def with_client(client: Any, body) -> Any:
             print(f"[exit] MCP client stop failed: {exc}", file=sys.stderr)
 
 
-def main(system_prompt: str = SYSTEM_PROMPT, default_name: str = DEFAULT_NAME) -> int:
-    args = parse_args(default_name)
+def main() -> int:
+    args = parse_args()
+    system_prompt = DIRECT_SYSTEM_PROMPT if args.prompt == "direct" else SYSTEM_PROMPT
 
     decider: Decider | None = None
     decider_down_at_start = False
